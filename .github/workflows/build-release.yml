@@ -21,10 +21,10 @@ jobs:
         run: npm install
 
       - name: Build macOS arm64 Artifacts
-        run: node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac dmg zip --arm64 --publish never
+        run: node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac dmg --arm64 --publish never
 
       - name: Build macOS x64 Artifacts
-        run: node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac dmg zip --x64 --publish never
+        run: node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false npx electron-builder --mac dmg --x64 --publish never
 
       - name: Upload macOS Artifacts
         uses: actions/upload-artifact@v4
