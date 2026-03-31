@@ -8,7 +8,6 @@ const { downloadToFile } = require('../core/http-download');
 const repoRoot = path.resolve(__dirname, '..', '..');
 const buildResourcesDir = path.join(repoRoot, 'desktop', 'build-resources');
 const ffmpegOutputDir = path.join(buildResourcesDir, 'ffmpeg');
-const bundledLicenseSource = path.join(repoRoot, 'desktop', 'vendor', 'playwright', 'ffmpeg-1011', 'COPYING.LGPLv2.1');
 const playwrightBrowsersPath = path.join(repoRoot, 'node_modules', 'playwright-core', 'browsers.json');
 const playwrightPrimaryMirror = 'https://cdn.playwright.dev/dbazure/download/playwright';
 
@@ -121,6 +120,7 @@ async function prepareTarget(config) {
   const zipPath = path.join(tempDir, config.archiveName);
   const extractDir = path.join(tempDir, 'extract');
   const destinationPath = path.join(ffmpegOutputDir, config.destinationRelativePath);
+  let licenseBuffer = null;
 
   try {
     console.log('[prepare:ffmpeg] downloading', config.key, 'from', config.url);
@@ -133,9 +133,14 @@ async function prepareTarget(config) {
     ensureDir(path.dirname(destinationPath));
     fs.copyFileSync(extractedBinary, destinationPath);
     if (process.platform !== 'win32') fs.chmodSync(destinationPath, 0o755);
+    const extractedLicensePath = findFileRecursive(extractDir, 'COPYING.LGPLv2.1');
+    if (extractedLicensePath) {
+      licenseBuffer = fs.readFileSync(extractedLicensePath);
+    }
   } finally {
     removeDir(tempDir);
   }
+  return licenseBuffer;
 }
 
 async function main() {
@@ -147,19 +152,21 @@ async function main() {
   if (!fs.existsSync(playwrightBrowsersPath)) {
     throw new Error('Missing ' + playwrightBrowsersPath + '. Run npm install first.');
   }
-  if (!fs.existsSync(bundledLicenseSource)) {
-    throw new Error('Missing FFmpeg license file at ' + bundledLicenseSource + '.');
-  }
 
   ensureDir(buildResourcesDir);
   removeDir(ffmpegOutputDir);
   ensureDir(ffmpegOutputDir);
 
   const revision = getPlaywrightFfmpegRevision();
+  let licenseBuffer = null;
   for (let index = 0; index < targets.length; index += 1) {
-    await prepareTarget(getTargetConfig(targets[index], revision));
+    const discoveredLicenseBuffer = await prepareTarget(getTargetConfig(targets[index], revision));
+    if (!licenseBuffer && discoveredLicenseBuffer) licenseBuffer = discoveredLicenseBuffer;
   }
-  fs.copyFileSync(bundledLicenseSource, path.join(ffmpegOutputDir, 'COPYING.LGPLv2.1'));
+  if (!licenseBuffer) {
+    throw new Error('Missing FFmpeg license file in downloaded archives.');
+  }
+  fs.writeFileSync(path.join(ffmpegOutputDir, 'COPYING.LGPLv2.1'), licenseBuffer);
 }
 
 main().catch((error) => {
