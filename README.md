@@ -17,14 +17,21 @@ Watermark removal powered by [monson](https://www.paypal.com/paypalme/afiqhamdan
 
 For most people, use the latest packaged Release from the right side of this GitHub page. You do not need to install Node dependencies.
 
-1. Install the latest Release from the right side of this GitHub page
-2. Open the app
-3. Click `Open Sora`
-4. Sign in in the Sora browser window
-5. Choose what you want to back up
-6. Choose your `Video Mode`, `Audio Mode`, and `Save location`
-7. Click `Start backup`
-8. Use `Open folder` after a run to jump to the backup location
+1. Download the latest Release from the right side of this GitHub page
+2. On macOS, open the `.dmg` that matches your Mac and drag `Sora Video Downloader.app` into `Applications`
+3. If macOS says the app is damaged or cannot be opened, that is the unsigned-app security warning rather than a broken build. Open Terminal and run:
+
+   ```bash
+   sudo xattr -rd com.apple.quarantine "/Applications/Sora Video Downloader.app"
+   ```
+
+4. Open the app
+5. Click `Open Sora`
+6. Sign in in the Sora browser window
+7. Choose what you want to back up
+8. Choose your `Video Mode`, `Audio Mode`, and `Save location`
+9. Click `Start backup`
+10. Use `Open folder` after a run to jump to the backup location
 
 ## Running From Source
 
