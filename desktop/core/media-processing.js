@@ -21,6 +21,28 @@ function getManagedFfmpegPath(baseDir) {
   return path.join(baseDir, 'ffmpeg', getFfmpegArch(), getFfmpegExecutableName());
 }
 
+function getBundledFfmpegKey() {
+  if (process.platform === 'darwin') {
+    return process.arch === 'arm64' ? 'mac-arm64' : 'mac-x64';
+  }
+  if (process.platform === 'win32') {
+    return 'win-x64';
+  }
+  return '';
+}
+
+function getPackagedBundledFfmpegPath() {
+  const bundleKey = getBundledFfmpegKey();
+  if (!bundleKey || !process.resourcesPath) return '';
+  return path.join(process.resourcesPath, 'ffmpeg', bundleKey, getFfmpegExecutableName());
+}
+
+function getDevelopmentBundledFfmpegPath() {
+  const bundleKey = getBundledFfmpegKey();
+  if (!bundleKey) return '';
+  return path.join(__dirname, '..', 'build-resources', 'ffmpeg', bundleKey, getFfmpegExecutableName());
+}
+
 function getLegacyMacManagedFfmpegPath() {
   if (process.platform !== 'darwin') return '';
   return path.join(
@@ -48,6 +70,8 @@ function uniqueCandidates(values) {
 
 function buildFfmpegCandidates(baseDir) {
   const candidates = [
+    getPackagedBundledFfmpegPath(),
+    getDevelopmentBundledFfmpegPath(),
     getManagedFfmpegPath(baseDir),
     getLegacyMacManagedFfmpegPath(),
   ];

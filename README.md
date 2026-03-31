@@ -66,8 +66,10 @@ After the app opens, use it the same way as the packaged app flow above.
 
 `No Audiomark` requires FFmpeg.
 
-- On macOS, the app will try to use an existing FFmpeg install first and can download FFmpeg automatically if needed
-- On other platforms, if FFmpeg is not available, switch to `With Audiomark` or install FFmpeg yourself
+- Packaged app releases bundle FFmpeg for supported macOS and Windows builds, so `No Audiomark` works without a separate FFmpeg install
+- If you are running from source instead of using a packaged app, the app will still try to use an existing FFmpeg install first
+- On macOS source runs, the app can download FFmpeg automatically if needed
+- On Windows source runs, if FFmpeg is not available, switch to `With Audiomark` or install FFmpeg yourself
 
 ## Download Folders
 

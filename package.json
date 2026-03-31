@@ -19,8 +19,18 @@
     "directories": {
       "output": "release"
     },
+    "extraResources": [
+      {
+        "from": "desktop/build-resources/ffmpeg",
+        "to": "ffmpeg",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ],
     "files": [
       "desktop/**/*",
+      "!desktop/build-resources/ffmpeg{,/**/*}",
       "uv-backup-logic.js",
       "README.md",
       "LICENSE"

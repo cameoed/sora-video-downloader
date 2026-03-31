@@ -5,7 +5,8 @@ const repoRoot = path.resolve(__dirname, '..', '..');
 
 function runNodeScript(scriptName) {
   const scriptPath = path.join(repoRoot, 'desktop', 'scripts', scriptName);
-  const result = spawnSync(process.execPath, [scriptPath], {
+  const extraArgs = process.argv.slice(2);
+  const result = spawnSync(process.execPath, [scriptPath, ...extraArgs], {
     cwd: repoRoot,
     stdio: 'inherit',
     env: process.env,
@@ -17,6 +18,7 @@ function runNodeScript(scriptName) {
 
 function main() {
   runNodeScript('prepare-icons.js');
+  runNodeScript('prepare-ffmpeg.js');
 }
 
 try {
