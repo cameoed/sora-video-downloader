@@ -25,7 +25,7 @@ const {
 } = backupLogic;
 
 const BACKUP_ORIGIN = 'https://sora.chatgpt.com';
-const BACKUP_DEFAULT_FEED_LIMIT = 20;
+const BACKUP_DEFAULT_FEED_LIMIT = 50;
 const BACKUP_DEFAULT_DRAFT_LIMIT = 50;
 const BACKUP_DOWNLOAD_FOLDER = 'Sora Video Downloader';
 const BACKUP_FETCH_MAX_ATTEMPTS = 4;
@@ -177,10 +177,6 @@ function buildBackupHistoricalBucketCounts(catalog, settings) {
   };
 }
 
-function normalizeBackupProfile(value) {
-  return value === 'balanced' ? 'balanced' : 'conservative';
-}
-
 function normalizeBackupPublishedMode(value) {
   return value === 'direct_sora' ? 'direct_sora' : 'smart';
 }
@@ -198,7 +194,6 @@ function normalizeCharacterHandle(value) {
 function normalizeBackupRequestSettings(value) {
   const raw = isPlainObject(value) ? value : {};
   return {
-    profile: normalizeBackupProfile(raw.profile),
     published_download_mode: normalizeBackupPublishedMode(raw.published_download_mode),
     audio_mode: normalizeBackupAudioMode(raw.audio_mode),
     character_handle: normalizeCharacterHandle(raw.character_handle),
@@ -206,13 +201,13 @@ function normalizeBackupRequestSettings(value) {
 }
 
 function getBackupFeedLimitForSettings(settings) {
-  const normalized = normalizeBackupRequestSettings(settings);
-  return normalized.profile === 'balanced' ? 50 : BACKUP_DEFAULT_FEED_LIMIT;
+  void settings;
+  return BACKUP_DEFAULT_FEED_LIMIT;
 }
 
 function getBackupDraftLimitForSettings(settings) {
-  const normalized = normalizeBackupRequestSettings(settings);
-  return normalized.profile === 'balanced' ? 75 : BACKUP_DEFAULT_DRAFT_LIMIT;
+  void settings;
+  return BACKUP_DEFAULT_DRAFT_LIMIT;
 }
 
 function getSelectedBackupBuckets(scopes, settings) {
@@ -220,7 +215,7 @@ function getSelectedBackupBuckets(scopes, settings) {
   const normalizedSettings = normalizeBackupRequestSettings(settings);
   const draftLimit = getBackupDraftLimitForSettings(normalizedSettings);
   const feedLimit = getBackupFeedLimitForSettings(normalizedSettings);
-  const incrementalBatchLimit = 100;
+  const incrementalBatchLimit = 25;
   const buckets = [];
   if (normalized.ownDrafts) {
     buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: draftLimit });
@@ -279,25 +274,39 @@ function extractCursorFromPayload(payload) {
   return cursor == null || cursor === '' ? null : String(cursor);
 }
 
+function resolveBackupPayloadEntity(kind, payload) {
+  if (!isPlainObject(payload)) return null;
+  if (String(kind) === 'draft') {
+    return isPlainObject(payload.draft) ? payload.draft : payload;
+  }
+  return isPlainObject(payload.post) ? payload.post : payload;
+}
+
 function getBackupItemId(kind, item) {
   if (!isPlainObject(item)) return '';
   if (String(kind) === 'draft') {
-    return sanitizeIdToken(item.id || item.generation_id || item.draft_id, 256) || '';
+    const draft = resolveBackupPayloadEntity(kind, item) || item;
+    return sanitizeIdToken(draft.id || draft.generation_id || draft.draft_id || item.id || item.generation_id || item.draft_id, 256) || '';
   }
   const post = item.post && typeof item.post === 'object' ? item.post : item;
   return sanitizeIdToken(post.id || item.id || post.post_id, 256) || '';
 }
 
 function pickPrompt(detail, item) {
-  const detailPost = detail && detail.post && typeof detail.post === 'object' ? detail.post : detail;
-  const listPost = item && item.post && typeof item.post === 'object' ? item.post : item;
+  const detailPost = resolveBackupPayloadEntity('published', detail) || detail;
+  const listPost = resolveBackupPayloadEntity('published', item) || item;
+  const detailDraft = resolveBackupPayloadEntity('draft', detail) || detail;
+  const listDraft = resolveBackupPayloadEntity('draft', item) || item;
   const values = [
     detailPost && detailPost.creation_config && detailPost.creation_config.prompt,
     detailPost && detailPost.prompt,
     detailPost && detailPost.caption,
     detailPost && detailPost.text,
+    detailDraft && detailDraft.creation_config && detailDraft.creation_config.prompt,
+    detailDraft && detailDraft.prompt,
     detail && detail.creation_config && detail.creation_config.prompt,
-    item && item.creation_config && item.creation_config.prompt,
+    listDraft && listDraft.creation_config && listDraft.creation_config.prompt,
+    listDraft && listDraft.prompt,
     listPost && listPost.prompt,
     listPost && listPost.caption,
     listPost && listPost.text,
@@ -311,17 +320,22 @@ function pickPrompt(detail, item) {
 }
 
 function pickPromptSource(detail, item) {
-  const detailPost = detail && detail.post && typeof detail.post === 'object' ? detail.post : detail;
+  const detailPost = resolveBackupPayloadEntity('published', detail) || detail;
+  const detailDraft = resolveBackupPayloadEntity('draft', detail) || detail;
   if (sanitizeString(detailPost && detailPost.creation_config && detailPost.creation_config.prompt, 4096)) return 'creation_config';
   if (sanitizeString(detailPost && detailPost.prompt, 4096)) return 'detail';
+  if (sanitizeString(detailDraft && detailDraft.creation_config && detailDraft.creation_config.prompt, 4096)) return 'creation_config';
+  if (sanitizeString(detailDraft && detailDraft.prompt, 4096)) return 'detail';
   if (
     sanitizeString(detailPost && detailPost.caption, 4096) ||
     sanitizeString(detailPost && detailPost.text, 4096)
   ) {
     return 'inline';
   }
-  const listPost = item && item.post && typeof item.post === 'object' ? item.post : item;
-  if (sanitizeString(item && item.creation_config && item.creation_config.prompt, 4096)) return 'creation_config';
+  const listPost = resolveBackupPayloadEntity('published', item) || item;
+  const listDraft = resolveBackupPayloadEntity('draft', item) || item;
+  if (sanitizeString(listDraft && listDraft.creation_config && listDraft.creation_config.prompt, 4096)) return 'creation_config';
+  if (sanitizeString(listDraft && listDraft.prompt, 4096)) return 'detail';
   if (
     sanitizeString(listPost && listPost.caption, 4096) ||
     sanitizeString(listPost && listPost.text, 4096) ||
@@ -333,12 +347,16 @@ function pickPromptSource(detail, item) {
 }
 
 function pickTitle(detail, item) {
-  const detailPost = detail && detail.post && typeof detail.post === 'object' ? detail.post : detail;
-  const listPost = item && item.post && typeof item.post === 'object' ? item.post : item;
+  const detailPost = resolveBackupPayloadEntity('published', detail) || detail;
+  const listPost = resolveBackupPayloadEntity('published', item) || item;
+  const detailDraft = resolveBackupPayloadEntity('draft', detail) || detail;
+  const listDraft = resolveBackupPayloadEntity('draft', item) || item;
   return (
     sanitizeString(detailPost && detailPost.title, 512) ||
+    sanitizeString(detailDraft && detailDraft.title, 512) ||
     sanitizeString(detail && detail.title, 512) ||
     sanitizeString(listPost && listPost.title, 512) ||
+    sanitizeString(listDraft && listDraft.title, 512) ||
     sanitizeString(item && item.title, 512) ||
     ''
   );
@@ -361,23 +379,32 @@ function collectBackupCastNames(detail, item) {
     }
   }
 
-  const detailPost = detail && detail.post && typeof detail.post === 'object' ? detail.post : detail;
-  const listPost = item && item.post && typeof item.post === 'object' ? item.post : item;
+  const detailPost = resolveBackupPayloadEntity('published', detail) || detail;
+  const listPost = resolveBackupPayloadEntity('published', item) || item;
+  const detailDraft = resolveBackupPayloadEntity('draft', detail) || detail;
+  const listDraft = resolveBackupPayloadEntity('draft', item) || item;
   pushAll(detailPost && detailPost.cameo_usernames);
+  pushAll(detailDraft && detailDraft.cameo_usernames);
   pushAll(detail && detail.cameos);
   pushAll(detail && detail.cameo_profiles);
   pushAll(listPost && listPost.cameo_usernames);
+  pushAll(listDraft && listDraft.cameo_usernames);
   pushAll(item && item.cameos);
   pushAll(item && item.cameo_profiles);
+  pushAll(detailDraft && detailDraft.creation_config && detailDraft.creation_config.cameo_profiles);
+  pushAll(listDraft && listDraft.creation_config && listDraft.creation_config.cameo_profiles);
   return candidates;
 }
 
 function resolveBackupDimensionsAndDuration(detail, item) {
   const root =
-    detail && detail.post && typeof detail.post === 'object'
-      ? detail.post
-      : (detail && detail.draft && typeof detail.draft === 'object' ? detail.draft : detail);
-  const fallback = item && item.post && typeof item.post === 'object' ? item.post : item;
+    resolveBackupPayloadEntity('draft', detail) ||
+    resolveBackupPayloadEntity('published', detail) ||
+    detail;
+  const fallback =
+    resolveBackupPayloadEntity('draft', item) ||
+    resolveBackupPayloadEntity('published', item) ||
+    item;
   const cfg =
     root && root.creation_config && typeof root.creation_config === 'object'
       ? root.creation_config
@@ -468,9 +495,11 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
   const prompt = pickPrompt(detail, listItem);
   const promptSource = pickPromptSource(detail, listItem);
   const title = pickTitle(detail, listItem);
-  const createdAt = (detail && (detail.created_at || (detail.post && detail.post.created_at))) || (listItem && (listItem.created_at || (listItem.post && listItem.post.created_at))) || null;
-  const postedAt = (detail && (detail.posted_at || (detail.post && detail.post.posted_at))) || (listItem && (listItem.posted_at || (listItem.post && listItem.post.posted_at))) || null;
-  const updatedAt = (detail && (detail.updated_at || (detail.post && detail.post.updated_at))) || (listItem && (listItem.updated_at || (listItem.post && listItem.post.updated_at))) || null;
+  const detailEntity = resolveBackupPayloadEntity(kind, detail) || detail;
+  const listEntity = resolveBackupPayloadEntity(kind, listItem) || listItem;
+  const createdAt = (detailEntity && detailEntity.created_at) || (detail && detail.created_at) || (listEntity && listEntity.created_at) || (listItem && listItem.created_at) || null;
+  const postedAt = (detailEntity && detailEntity.posted_at) || (detail && detail.posted_at) || (listEntity && listEntity.posted_at) || (listItem && listItem.posted_at) || null;
+  const updatedAt = (detailEntity && detailEntity.updated_at) || (detail && detail.updated_at) || (listEntity && listEntity.updated_at) || (listItem && listItem.updated_at) || null;
   const dims = resolveBackupDimensionsAndDuration(detail, listItem);
   const castNames = collectBackupCastNames(detail, listItem);
   const media = pickBackupMediaSource(kind, detail || listItem);
@@ -629,7 +658,8 @@ function buildBackupBucketProgressSnapshot(run, items, historicalCounts) {
     const item = list[index];
     const bucketKey = normalizeBackupBucketKey(item && item.bucket);
     if (!bucketKey) continue;
-    if (normalizeItemStatus(item && item.status) === 'done') {
+    const status = normalizeItemStatus(item && item.status);
+    if (status === 'done' || status === 'failed' || status === 'skipped') {
       completedByBucket[bucketKey] = (Number(completedByBucket[bucketKey]) || 0) + 1;
     }
   }

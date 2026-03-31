@@ -15,8 +15,6 @@ const {
   normalizeCharacterHandle,
   normalizeCurrentUser,
   extractOwnerIdentity,
-  shouldExcludeAppearanceOwner,
-  sameOwnerIdentity,
   pickBackupMediaSource,
   inferFileExtension,
   isSignedUrlFresh,
@@ -36,13 +34,13 @@ const {
   extractCursorFromPayload,
   getBackupItemId,
   buildBackupFolderName,
+  buildBackupFilename,
   buildBackupManifestItem,
   buildBackupDetailPath,
   pickPrompt,
   pickPromptSource,
   pickTitle,
   sanitizeString,
-  cloneBackupBucketCounts,
 } = require('./helpers');
 
 class BackupCancelledError extends Error {
@@ -72,11 +70,11 @@ class BackupService extends EventEmitter {
     this.state = await this.store.getState();
     const settings = this.state.settings || {};
     if (!settings.downloadDir) settings.downloadDir = this.defaultDownloadDir;
-    if (!settings.profile) settings.profile = 'conservative';
     if (!settings.published_download_mode) settings.published_download_mode = 'smart';
     settings.audio_mode = normalizeBackupAudioMode(settings.audio_mode);
     if (!settings.selectedScope) settings.selectedScope = 'ownPosts';
     if (!settings.character_handle) settings.character_handle = '';
+    delete settings.profile;
     settings.theme = 'dark';
     this.state.settings = settings;
     this.state.bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
@@ -104,6 +102,7 @@ class BackupService extends EventEmitter {
   async updateSettings(partial) {
     const nextSettings = Object.assign({}, this.state.settings, partial || {});
     nextSettings.audio_mode = normalizeBackupAudioMode(nextSettings.audio_mode);
+    delete nextSettings.profile;
     this.state.settings = nextSettings;
     await this.store.saveState(this.state);
     return this.state.settings;
@@ -147,7 +146,6 @@ class BackupService extends EventEmitter {
     settings.downloadDir = payload && payload.downloadDir ? payload.downloadDir : this.state.settings.downloadDir;
     await this.updateSettings({
       downloadDir: settings.downloadDir,
-      profile: settings.profile,
       published_download_mode: settings.published_download_mode,
       audio_mode: settings.audio_mode,
       character_handle: settings.character_handle,
@@ -307,6 +305,7 @@ class BackupService extends EventEmitter {
 
       let cursor = null;
       let pageNumber = 0;
+      const seenCursors = new Set();
 
       do {
         this._throwIfCancelled(job);
@@ -341,12 +340,6 @@ class BackupService extends EventEmitter {
             detail = await this._fetchBackupDetail(bucket.kind, id);
             owner = extractOwnerIdentity(detail || listItem);
           }
-          if (
-            (bucket.key === 'castInPosts' || bucket.key === 'castInDrafts') &&
-            shouldExcludeAppearanceOwner(owner, job.run.current_user)
-          ) {
-            continue;
-          }
           if (this._isAlreadySaved(job, bucket.key, id)) {
             continue;
           }
@@ -372,7 +365,12 @@ class BackupService extends EventEmitter {
         }
 
         const nextCursor = extractCursorFromPayload(json);
-        cursor = nextCursor && items.length ? nextCursor : null;
+        if (nextCursor && !seenCursors.has(nextCursor)) {
+          seenCursors.add(nextCursor);
+          cursor = nextCursor;
+        } else {
+          cursor = null;
+        }
       } while (cursor);
     }
   }
@@ -385,7 +383,7 @@ class BackupService extends EventEmitter {
       if (normalizeItemStatus(item.status) !== 'queued') continue;
       this._throwIfCancelled(job);
 
-      const preparedItem = await this._refreshBackupItemMedia(item);
+      const preparedItem = await this._refreshBackupItemMedia(job.run, item);
       if (!preparedItem.media_url) {
         this._transitionItem(job, preparedItem, 'failed', {
           last_error: preparedItem.last_error || 'missing_media_url',
@@ -465,7 +463,7 @@ class BackupService extends EventEmitter {
     return false;
   }
 
-  async _refreshBackupItemMedia(item) {
+  async _refreshBackupItemMedia(run, item) {
     const freshEnough =
       item.media_url &&
       isSignedUrlFresh(item.media_url, item.url_refreshed_at || 0, Date.now()) &&
@@ -498,6 +496,7 @@ class BackupService extends EventEmitter {
       item.media_variant = media.variant;
       item.media_ext = media.ext || inferFileExtension(media.url, media.mimeType);
       item.media_key_path = media.keyPath || '';
+      item.filename = buildBackupFilename(run, item.bucket, item.id, item.media_ext);
       item.url_refreshed_at = Date.now();
       item.last_error = '';
       return item;
