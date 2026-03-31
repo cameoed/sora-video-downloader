@@ -1,6 +1,7 @@
 node_modules/
 dist/
 release/
+tests/
 *.log
 desktop/vendor/
 desktop/build-resources/icon.ico
