@@ -10,7 +10,7 @@
     "start:app": "node desktop/scripts/prepare-icons.js && electron .",
     "dist": "node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never",
     "dist:mac": "node desktop/scripts/prepare-release.js mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --publish never",
-    "dist:win": "node desktop/scripts/prepare-release.js win && electron-builder --win nsis portable --publish never"
+    "dist:win": "node desktop/scripts/prepare-release.js win && electron-builder --win nsis portable --x64 --publish never"
   },
   "build": {
     "appId": "com.sora.backup.app",
@@ -36,7 +36,7 @@
     },
     "win": {
       "icon": "desktop/build-resources/icon.ico",
-      "artifactName": "${productName}-${version}-${arch}-${target}.${ext}",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
       "target": [
         "nsis",
         "portable"
