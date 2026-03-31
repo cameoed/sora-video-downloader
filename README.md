@@ -9,7 +9,9 @@ It can download:
 - Drafts of me
 - Posts from a selected character
 
-Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), and [alexandria](https://github.com/alexdredmon). Watermark removal powered by [monson](https://www.paypal.com/paypalme/afiqhamdan/).
+Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), and [alexandria](https://github.com/alexdredmon).
+
+Watermark removal powered by [monson](https://www.paypal.com/paypalme/afiqhamdan/) — please consider donating to them as a thank you for creating the key piece to this puzzle.
 
 ## What It Does
 
