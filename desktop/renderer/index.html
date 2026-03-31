@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sora Video Downloader</title>
+    <link rel="stylesheet" href="./styles.css">
+  </head>
+  <body>
+    <main class="panel-shell">
+      <section class="panel-frame">
+        <header class="panel-head">
+          <div class="panel-title-row">
+            <div class="panel-title-copy">
+              <h1>Sora Video Downloader</h1>
+              <p id="heroSubtitle" class="panel-subtitle">Click 'Open Sora' in the corner and log in to access your archive.</p>
+            </div>
+            <button id="openLoginBtn" type="button" class="session-pill" data-tone="warn">Open Sora</button>
+          </div>
+
+          <div class="panel-progress-meta">
+            <span id="progressBadge" class="panel-progress-badge">0% complete</span>
+            <button id="openRunFolderBtn" type="button" class="panel-link-button" hidden>Open folder</button>
+          </div>
+
+          <div class="panel-progress" data-backup-progress>
+            <div class="panel-progress-track" aria-hidden="true">
+              <span id="progressFill" class="panel-progress-fill"></span>
+            </div>
+          </div>
+
+        </header>
+
+        <div class="panel-content-grid">
+          <section class="panel-section panel-section--guide">
+            <div class="backup-section">
+              <div class="section-strip">
+                <div class="section-header section-header--tight">
+                  <p class="section-label">Backup</p>
+                  <p class="section-note">Set your preferences, then start backup!</p>
+                </div>
+                <div class="backup-actions backup-actions--inline">
+                  <button id="startBackupBtn" type="button">Start backup</button>
+                  <button id="cancelBackupBtn" type="button">Stop</button>
+                </div>
+              </div>
+
+              <div class="route-card route-card--compact">
+                <div class="route-list route-list--compact">
+                  <div class="route-row">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="ownPosts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">My posts</span>
+                    </label>
+                    <span id="scopeProgressOwnPosts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="ownDrafts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">My drafts</span>
+                    </label>
+                    <span id="scopeProgressOwnDrafts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="castInPosts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">Cast-in posts</span>
+                    </label>
+                    <span id="scopeProgressCastInPosts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="castInDrafts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">Drafts of me</span>
+                    </label>
+                    <span id="scopeProgressCastInDrafts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row route-row--character">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="characterPosts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span id="characterScopeName" class="route-name">Select a character</span>
+                    </label>
+                    <div class="character-field-wrap">
+                      <input id="characterHandle" type="text" class="route-input" placeholder="@character">
+                    </div>
+                    <span id="scopeProgressCharacterPosts" class="route-progress">?</span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </section>
+
+          <section class="panel-section panel-section--settings">
+            <div class="settings-card">
+              <div class="section-header section-header--tight">
+                <p class="section-label">Settings</p>
+                <p class="section-note">Tune download behavior and choose where your backups land.</p>
+              </div>
+
+              <div class="settings-body settings-body--flat">
+                <div class="control-grid">
+                  <label class="control-field" for="modeSelect">
+                    <span class="control-label">Video Mode</span>
+                    <select id="modeSelect">
+                      <option value="smart">No Watermark</option>
+                      <option value="direct_sora">With Watermark</option>
+                    </select>
+                  </label>
+
+                  <label class="control-field" for="audioModeSelect">
+                    <span class="control-label">
+                      <span>Audio Mode</span>
+                      <span
+                        class="field-help"
+                        tabindex="0"
+                        data-tooltip="Sora hides an audiomark in all videos that tells social media platforms to label this video as AI."
+                        aria-label="Sora hides an audiomark in all videos that tells social media platforms to label this video as AI."
+                      >?</span>
+                    </span>
+                    <select id="audioModeSelect">
+                      <option value="no_audiomark">No Audiomark</option>
+                      <option value="with_audiomark">With Audiomark</option>
+                    </select>
+                  </label>
+
+                  <label class="control-field" for="profileSelect">
+                    <span class="control-label">Pacing</span>
+                    <select id="profileSelect">
+                      <option value="conservative">Conservative</option>
+                      <option value="balanced">Balanced</option>
+                    </select>
+                  </label>
+
+                </div>
+
+                <div class="settings-storage">
+                  <label class="control-field control-field--wide" for="downloadDir">
+                    <span class="control-label">Save location</span>
+                    <div class="storage-field">
+                      <input id="downloadDir" type="text" readonly>
+                      <button id="chooseDirBtn" type="button" class="storage-button">Browse</button>
+                    </div>
+                  </label>
+                </div>
+              </div>
+            </div>
+          </section>
+        </div>
+      </section>
+      <p class="panel-credit">
+        by
+        <a href="https://github.com/cameoed" target="_blank" rel="noreferrer noopener">topher</a>
+        with huge contributions by
+        <a href="https://github.com/lgcarrier" target="_blank" rel="noreferrer noopener">lgcarrier</a>,
+        <a href="https://github.com/byeson" target="_blank" rel="noreferrer noopener">byeson</a>,
+        <a href="https://github.com/slogonomo" target="_blank" rel="noreferrer noopener">slogonomo</a>,
+        and
+        <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>
+        <br>
+        watermark removal powered by
+        <a href="https://www.paypal.com/paypalme/afiqhamdan/" target="_blank" rel="noreferrer noopener">monson</a>
+      </p>
+    </main>
+
+    <script src="./renderer.js"></script>
+  </body>
+</html>

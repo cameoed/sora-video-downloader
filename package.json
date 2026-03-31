@@ -1,0 +1,60 @@
+{
+  "name": "sora-backup-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Desktop Sora video downloader for macOS and Windows using Electron.",
+  "main": "desktop/main.js",
+  "scripts": {
+    "prepare:icons": "node desktop/scripts/prepare-icons.js",
+    "prepare:release": "node desktop/scripts/prepare-release.js",
+    "start:app": "node desktop/scripts/prepare-icons.js && electron .",
+    "dist": "node desktop/scripts/prepare-release.js && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --publish never",
+    "dist:mac": "node desktop/scripts/prepare-release.js mac && CSC_IDENTITY_AUTO_DISCOVERY=false electron-builder --mac dmg zip --publish never",
+    "dist:win": "node desktop/scripts/prepare-release.js win && electron-builder --win nsis portable --publish never"
+  },
+  "build": {
+    "appId": "com.sora.backup.app",
+    "productName": "Sora Video Downloader",
+    "asar": true,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "desktop/**/*",
+      "uv-backup-logic.js",
+      "README.md",
+      "LICENSE"
+    ],
+    "mac": {
+      "category": "public.app-category.productivity",
+      "icon": "desktop/build-resources/icon.icns",
+      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "target": [
+        "dmg",
+        "zip"
+      ]
+    },
+    "win": {
+      "icon": "desktop/build-resources/icon.ico",
+      "artifactName": "${productName}-${version}-${arch}-${target}.${ext}",
+      "target": [
+        "nsis",
+        "portable"
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "Sora Video Downloader"
+    }
+  },
+  "dependencies": {
+    "playwright": "^1.52.0"
+  },
+  "devDependencies": {
+    "electron": "^35.1.4",
+    "electron-builder": "^24.13.3"
+  }
+}

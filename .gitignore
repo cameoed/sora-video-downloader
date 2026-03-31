@@ -1,0 +1,8 @@
+node_modules/
+dist/
+release/
+*.log
+desktop/vendor/
+desktop/build-resources/icon.ico
+desktop/build-resources/icon.icns
+desktop/build-resources/icon.iconset/
