@@ -15,33 +15,18 @@ Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarr
 
 Watermark removal powered by [monson](https://www.paypal.com/paypalme/afiqhamdan/) — please consider donating to them as a thank you for creating the key piece to this puzzle.
 
-## What It Does
-
-- Opens Sora in a built-in browser window so you can sign in
-- Lets you back up one scope at a time:
-  - My posts
-  - My drafts
-  - Cast-in posts
-  - Drafts of me
-  - Posts from a selected character
-- Lets you choose:
-  - `Video Mode`: `No Watermark` or `With Watermark`
-  - `Audio Mode`: `No Audiomark` or `With Audiomark`
-  - `Save location`
-- Tracks progress while it scans and downloads
-- Creates organized download folders based on the scope and output settings you chose
-
 ## Using The App
 
-If you are using a packaged app build, you do not need to install Node dependencies.
+For most people, use the latest packaged Release from the right side of this GitHub page. You do not need to install Node dependencies.
 
-1. Open the app
-2. Click `Open Sora`
-3. Sign in in the Sora browser window
-4. Choose what you want to back up
-5. Choose your `Video Mode`, `Audio Mode`, and `Save location`
-6. Click `Start backup`
-7. Use `Open folder` after a run to jump to the backup location
+1. Install the latest Release from the right side of this GitHub page
+2. Open the app
+3. Click `Open Sora`
+4. Sign in in the Sora browser window
+5. Choose what you want to back up
+6. Choose your `Video Mode`, `Audio Mode`, and `Save location`
+7. Click `Start backup`
+8. Use `Open folder` after a run to jump to the backup location
 
 ## Running From Source
 
@@ -64,15 +49,6 @@ After the app opens, use it the same way as the packaged app flow above.
 - `With Audiomark` saves the downloaded video as-is
 - `No Audiomark` removes the audiomark and writes the final file as `.mov`
 
-## FFmpeg Note
-
-`No Audiomark` requires FFmpeg.
-
-- Packaged app releases bundle FFmpeg for supported macOS and Windows builds, so `No Audiomark` works without a separate FFmpeg install
-- If you are running from source instead of using a packaged app, the app will still try to use an existing FFmpeg install first
-- On macOS source runs, the app can download FFmpeg automatically if needed
-- On Windows source runs, if FFmpeg is not available, switch to `With Audiomark` or install FFmpeg yourself
-
 ## Download Folders
 
 Downloads are saved inside a main folder called `Sora Video Downloader`.
@@ -92,6 +68,7 @@ If you want to build distributable app packages from source:
 ## Notes
 
 - This is an unofficial community tool
+- **Not affiliated with Sora or OpenAI**
 - Your backup data stays on your machine
 - The app is built for macOS and Windows
 
