@@ -2,8 +2,6 @@
 
 Sora Video Downloader is a simple desktop app for saving your Sora videos to your computer.
 
-![Sora Video Downloader app preview](./icons/preview.png)
-
 It can download:
 - My posts
 - My drafts
