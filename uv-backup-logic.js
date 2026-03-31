@@ -59,9 +59,20 @@
     };
   }
 
+  function createEmptyScopes() {
+    return {
+      ownDrafts: false,
+      ownPosts: false,
+      castInPosts: false,
+      castInDrafts: false,
+      characterPosts: false,
+    };
+  }
+
   function normalizeBackupScopes(raw) {
-    const base = cloneScopes(DEFAULT_BACKUP_SCOPES);
-    if (!raw || typeof raw !== 'object') return base;
+    if (!raw || typeof raw !== 'object') return cloneScopes(DEFAULT_BACKUP_SCOPES);
+    const hasExplicitKeys = BACKUP_SCOPE_KEYS.some((key) => raw[key] === true || raw[key] === false);
+    const base = hasExplicitKeys ? createEmptyScopes() : cloneScopes(DEFAULT_BACKUP_SCOPES);
     for (const key of BACKUP_SCOPE_KEYS) {
       if (raw[key] === true || raw[key] === false) base[key] = raw[key];
     }

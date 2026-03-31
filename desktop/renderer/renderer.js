@@ -4,7 +4,6 @@
   const state = {
     settings: {
       downloadDir: '',
-      profile: 'conservative',
       published_download_mode: 'smart',
       audio_mode: 'with_audiomark',
       selectedScope: 'ownPosts',
@@ -29,7 +28,6 @@
     progressFill: document.getElementById('progressFill'),
     downloadDir: document.getElementById('downloadDir'),
     chooseDirBtn: document.getElementById('chooseDirBtn'),
-    profileSelect: document.getElementById('profileSelect'),
     modeSelect: document.getElementById('modeSelect'),
     audioModeSelect: document.getElementById('audioModeSelect'),
     characterHandle: document.getElementById('characterHandle'),
@@ -272,7 +270,6 @@
 
   function renderSettings() {
     ui.downloadDir.value = state.settings.downloadDir || '';
-    ui.profileSelect.value = state.settings.profile || 'conservative';
     ui.modeSelect.value = state.settings.published_download_mode || 'smart';
     ui.audioModeSelect.value = state.settings.audio_mode || 'with_audiomark';
     ui.characterHandle.value = state.settings.character_handle || '';
@@ -418,7 +415,6 @@
     const selectedScope = getSelectedScope();
     const characterHandle = ui.characterHandle.value.trim();
     const settingsPatch = {
-      profile: ui.profileSelect.value,
       published_download_mode: ui.modeSelect.value,
       audio_mode: ui.audioModeSelect.value,
       selectedScope: selectedScope,
@@ -430,7 +426,6 @@
     const response = await appApi.startBackup({
       scopes: buildScopes(),
       settings: {
-        profile: state.settings.profile,
         published_download_mode: state.settings.published_download_mode,
         audio_mode: state.settings.audio_mode,
         character_handle: state.settings.character_handle,
@@ -491,9 +486,6 @@
   ui.cancelBackupBtn.addEventListener('click', handleCancelBackup);
   ui.openRunFolderBtn.addEventListener('click', handleOpenRunFolder);
 
-  ui.profileSelect.addEventListener('change', () => {
-    persistSettings({ profile: ui.profileSelect.value }).catch(() => {});
-  });
   ui.modeSelect.addEventListener('change', () => {
     persistSettings({ published_download_mode: ui.modeSelect.value }).catch(() => {});
   });
