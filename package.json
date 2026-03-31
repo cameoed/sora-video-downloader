@@ -1,6 +1,6 @@
 {
   "name": "sora-backup-app",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "Desktop Sora video downloader for macOS and Windows using Electron.",
   "main": "desktop/main.js",
