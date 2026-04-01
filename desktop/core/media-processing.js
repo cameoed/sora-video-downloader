@@ -16,7 +16,7 @@ const SOCIAL_AUTO_CROP_FILTER =
   'crop=if(gte(iw\\,ih)\\,trunc(min(iw\\,ih*16/9)/2)*2\\,trunc(min(iw\\,ih*9/16)/2)*2):if(gte(iw\\,ih)\\,trunc(min(ih\\,iw*9/16)/2)*2\\,trunc(min(ih\\,iw*16/9)/2)*2):(iw-ow)/2:(ih-oh)/2';
 
 function normalizeAudioMode(value) {
-  return value === 'no_audiomark' ? 'no_audiomark' : 'with_audiomark';
+  return value === 'with_audiomark' ? 'with_audiomark' : 'no_audiomark';
 }
 
 function normalizeFramingMode(value) {
@@ -259,7 +259,6 @@ function buildStreamMapArgs(audioMode) {
   if (normalizeAudioMode(audioMode) !== 'no_audiomark') {
     return ['-map', '0'];
   }
-  // Restrict sanitized exports to media streams so sidecar data tracks such as C2PA manifests are not carried over.
   return ['-map', '0:v?', '-map', '0:a?', '-map', '0:s?'];
 }
 

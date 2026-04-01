@@ -18,8 +18,6 @@ const DEFAULT_DOWNLOAD_HEADERS = {
 const REQUEST_BUFFER_TIMEOUT_MS = 15000;
 const DOWNLOAD_SOCKET_TIMEOUT_MS = 20000;
 
-// Add new no-watermark backends here. Each provider only needs a stable `id`
-// plus a `resolve(item, options)` function that returns `{ url, headers }`.
 const SMART_DOWNLOAD_PROVIDERS = [
   {
     id: 'konten',

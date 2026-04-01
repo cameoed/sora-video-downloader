@@ -1,88 +1,128 @@
 # Sora Video Downloader
 
-Sora Video Downloader is a simple desktop app for saving your Sora videos to your computer.
+Desktop app for saving your Sora videos and draft prompts.
 
 ![Sora Video Downloader app preview](./icons/preview.png)
 
-It can download:
-- My posts
-- My drafts
-- Cast-in posts
-- Drafts of me
-- Posts from a selected character
+## Features
 
-Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), and [alexandria](https://github.com/alexdredmon).
+- Sign in through the built-in `Open Sora` flow
+- Save from:
+  `My Posts`, `My Drafts`, `My Draft Prompts`, `Cast-in Posts`, `Drafts of Me`, and `Character`
+- No-watermark mode with provider failover
+- AI label controls:
+  `No AI Label` or `With AI Label`
+- Crop controls:
+  `Default Crop` or `16:9 for Social`
+- Progress UI with page-aware scan updates
+- `Open folder` shortcut after a run
+- `Clear cache` for remembered download history
+- Prompt CSV export with similar draft prompts de-duplicated
+
+Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), [alexandria](https://github.com/alexdredmon).
 
 Watermark removal powered by [monson](https://kontenai.net?ref=topher) and [soravdl](https://soravdl.com).
 
-## Using The App
+## Install
 
-For most people, use the latest packaged Release from the right side of this GitHub page. You do not need to install Node dependencies.
+Use the latest GitHub Release if you just want the app.
 
-1. Download the latest Release from the right side of this GitHub page
-2. On macOS, open the `.dmg` that matches your Mac and drag `Sora Video Downloader.app` into `Applications`
-3. If macOS says the app is damaged or cannot be opened, that is the unsigned-app security warning rather than a broken build. Open Terminal and run:
+macOS:
+1. Download the correct `.dmg`
+2. Drag `Sora Video Downloader.app` into `Applications`
+3. If macOS blocks it, run:
 
-   ```bash
-   sudo xattr -rd com.apple.quarantine "/Applications/Sora Video Downloader.app"
-   ```
+```bash
+sudo xattr -rd com.apple.quarantine "/Applications/Sora Video Downloader.app"
+```
 
-4. Open the app
-5. Click `Open Sora`
-6. Sign in in the Sora browser window
-7. Choose what you want to back up
-8. Choose your `Video Mode`, `Audio Mode`, and `Save location`
-9. Click `Start backup`
-10. Use `Open folder` after a run to jump to the backup location
+Windows:
+1. Download the latest `.exe`
+2. Run the installer
 
-## Running From Source
+## Use
 
-If you are running the repository directly instead of using a packaged app:
+1. Open the app
+2. Click `Open Sora`
+3. Sign in
+4. Pick a backup type
+5. Pick your settings and save location
+6. Click `Start backup` or `Save prompts`
 
-1. Install dependencies with `npm install`
-2. Start the app with `npm run start:app`
+## Backup Types
 
-After the app opens, use it the same way as the packaged app flow above.
+- `My Posts`
+  Downloads your published Sora posts.
 
-## Output And Modes
+- `My Drafts`
+  Downloads your draft videos.
 
-`Video Mode`
+- `My Draft Prompts`
+  Saves a CSV of draft prompts.
+  Similar prompts are de-duplicated before export.
 
-- `No Watermark` is the app's no-watermark mode
-- `With Watermark` keeps the watermark in the downloaded output
+- `Cast-in Posts`
+  Downloads posts where you appear.
 
-`Audio Mode`
+- `Drafts of Me`
+  Downloads drafts where you appear.
 
-- `With Audiomark` saves the downloaded video as-is
-- `No Audiomark` removes the audiomark, strips C2PA manifest data, and writes the final file as `.mov`
+- `Character`
+  Downloads posts for the handle entered in the character box.
 
-`Crop`
+## Settings
 
-- `Default Crop` preserves the source framing
-- `16:9 for Social` center-crops landscape videos to 16:9, portrait videos to 9:16, and re-encodes the video for export
+- `Video Mode`
+  `No Watermark` tries to save a no-watermark version.
+  `With Watermark` keeps the original version.
 
-## Download Folders
+- `AI Label`
+  `No AI Label` removes the audiomark and strips C2PA manifest data.
+  `With AI Label` keeps the original labeling.
 
-Downloads are saved inside a main folder called `Sora Video Downloader`.
+- `Crop`
+  `Default Crop` keeps the source framing.
+  `16:9 for Social` exports social-ready framing.
 
-Inside that, the app creates folders based on the mode and your selected output settings, for example:
-- `My Sora Posts - No Watermark, No Audiomark, Default Crop`
-- `My Sora Drafts - No Watermark, Yes Audiomark, 16:9 for Social`
-- `@ringcamera Sora Posts - No Watermark, Yes Audiomark`
+- `Save location`
+  Chooses where downloads and prompt CSVs are written.
 
-## Building Packaged Apps
+## Output
 
-If you want to build distributable app packages from source:
+Everything is saved inside a `Sora Video Downloader` folder in your chosen save location.
 
-- `npm run dist:mac` builds macOS files
-- `npm run dist:win` builds Windows files
+Video runs create folders based on the selected backup type and export settings.
+
+`My Draft Prompts` writes a CSV file named `my-prompts.csv` inside `Sora Video Downloader/My Sora Prompts`.
+The CSV starts with:
+
+`All draft prompts with similar prompts de-duplicated!`
+
+## Cache
+
+`Clear cache` resets remembered download history for selected modes or characters.
+It does not delete files already saved on disk.
+
+## Run From Source
+
+```bash
+npm install
+npm run start:app
+```
+
+## Build
+
+```bash
+npm run dist:mac
+npm run dist:win
+```
 
 ## Notes
 
-- This is an unofficial community tool
-- **Not affiliated with Sora or OpenAI**
-- Your backup data stays on your machine
-- The app is built for macOS and Windows
+- Unofficial community tool
+- Not affiliated with Sora or OpenAI
+- Data stays on your machine
+- Built with Electron for macOS and Windows
 
 ## License
 

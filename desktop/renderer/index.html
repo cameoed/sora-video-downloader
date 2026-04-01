@@ -21,6 +21,7 @@
           <div class="panel-progress-meta">
             <span id="progressBadge" class="panel-progress-badge">0% complete</span>
             <button id="openRunFolderBtn" type="button" class="panel-link-button" hidden>Open folder</button>
+            <button id="clearCacheBtn" type="button" class="panel-link-button">Clear cache</button>
           </div>
 
           <div class="panel-progress" data-backup-progress>
@@ -51,7 +52,7 @@
                     <label class="route-row--selectable">
                       <input type="radio" name="scope" value="ownPosts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <span class="route-name">My posts</span>
+                      <span class="route-name">My Posts</span>
                     </label>
                     <span id="scopeProgressOwnPosts" class="route-progress">?</span>
                   </div>
@@ -60,16 +61,25 @@
                     <label class="route-row--selectable">
                       <input type="radio" name="scope" value="ownDrafts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <span class="route-name">My drafts</span>
+                      <span class="route-name">My Drafts</span>
                     </label>
                     <span id="scopeProgressOwnDrafts" class="route-progress">?</span>
                   </div>
 
                   <div class="route-row">
                     <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="ownPrompts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">My Draft Prompts</span>
+                    </label>
+                    <span id="scopeProgressOwnPrompts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row">
+                    <label class="route-row--selectable">
                       <input type="radio" name="scope" value="castInPosts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <span class="route-name">Cast-in posts</span>
+                      <span class="route-name">Cast-in Posts</span>
                     </label>
                     <span id="scopeProgressCastInPosts" class="route-progress">?</span>
                   </div>
@@ -78,7 +88,7 @@
                     <label class="route-row--selectable">
                       <input type="radio" name="scope" value="castInDrafts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <span class="route-name">Drafts of me</span>
+                      <span class="route-name">Drafts of Me</span>
                     </label>
                     <span id="scopeProgressCastInDrafts" class="route-progress">?</span>
                   </div>
@@ -87,11 +97,8 @@
                     <label class="route-row--selectable">
                       <input type="radio" name="scope" value="characterPosts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <span id="characterScopeName" class="route-name">Select a character</span>
-                    </label>
-                    <div class="character-field-wrap">
                       <input id="characterHandle" type="text" class="route-input" placeholder="@character">
-                    </div>
+                    </label>
                     <span id="scopeProgressCharacterPosts" class="route-progress">?</span>
                   </div>
                 </div>
@@ -111,24 +118,24 @@
                   <label class="control-field" for="modeSelect">
                     <span class="control-label">Video Mode</span>
                     <select id="modeSelect">
-                      <option value="smart">No Watermark</option>
+                      <option value="smart" selected>No Watermark</option>
                       <option value="direct_sora">With Watermark</option>
                     </select>
                   </label>
 
                   <label class="control-field" for="audioModeSelect">
                     <span class="control-label">
-                      <span>Audio Mode</span>
+                      <span>AI Label</span>
                       <span
                         class="field-help"
                         tabindex="0"
-                        data-tooltip="Sora videos can include an audiomark and C2PA manifest data that signal AI provenance. No Audiomark removes the audiomark and strips C2PA manifest info from the exported file."
-                        aria-label="Sora videos can include an audiomark and C2PA manifest data that signal AI provenance. No Audiomark removes the audiomark and strips C2PA manifest info from the exported file."
+                        data-tooltip="Sora videos are encoded at 96 kHz and include C2PA manifest data to signal AI provenance to social media platforms. This option removes the audiomark and strips C2PA manifest info from the exported file."
+                        aria-label="Sora videos are encoded at 96 kHz and include C2PA manifest data to signal AI provenance to social media platforms. This option removes the audiomark and strips C2PA manifest info from the exported file."
                       >?</span>
                     </span>
                     <select id="audioModeSelect">
-                      <option value="no_audiomark">No Audiomark</option>
-                      <option value="with_audiomark">With Audiomark</option>
+                      <option value="no_audiomark" selected>No AI Label</option>
+                      <option value="with_audiomark">With AI Label</option>
                     </select>
                   </label>
 
@@ -157,13 +164,12 @@
         </div>
       </section>
       <p class="panel-credit">
-        by
-        <a href="https://github.com/cameoed" target="_blank" rel="noreferrer noopener">topher</a>
+        built by
+        <a href="http://discord.gg/topher" target="_blank" rel="noreferrer noopener">topher</a>
         with huge contributions by
         <a href="https://github.com/lgcarrier" target="_blank" rel="noreferrer noopener">lgcarrier</a>,
         <a href="https://github.com/byeson" target="_blank" rel="noreferrer noopener">byeson</a>,
         <a href="https://github.com/slogonomo" target="_blank" rel="noreferrer noopener">slogonomo</a>,
-        and
         <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>
         <br>
         watermark removal powered by
@@ -171,6 +177,40 @@
         and
         <a href="https://soravdl.com" target="_blank" rel="noreferrer noopener">soravdl</a>
       </p>
+
+      <div id="clearCacheModal" class="cache-modal" hidden>
+        <div id="clearCacheBackdrop" class="cache-modal-backdrop"></div>
+        <section class="cache-modal-card" role="dialog" aria-modal="true" aria-labelledby="clearCacheTitle">
+          <div class="cache-modal-head">
+            <div class="section-header section-header--tight">
+              <p class="section-label">Clear Cache</p>
+              <h2 id="clearCacheTitle" class="cache-modal-title">Reset remembered download history</h2>
+              <p class="section-note">Choose which caches to clear. This does not delete downloaded files.</p>
+            </div>
+          </div>
+
+          <div class="cache-modal-body">
+            <p id="clearCacheLoading" class="cache-modal-status">Loading cache targets…</p>
+
+            <div id="clearCacheContent">
+              <div class="cache-option-section">
+                <p class="cache-option-heading">Modes</p>
+                <div id="clearCacheModesList" class="cache-option-list"></div>
+              </div>
+
+              <div id="clearCacheCharactersSection" class="cache-option-section" hidden>
+                <p class="cache-option-heading">Characters</p>
+                <div id="clearCacheCharactersList" class="cache-option-list"></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="cache-modal-actions">
+            <button id="clearCacheCancelBtn" type="button" class="panel-link-button">Cancel</button>
+            <button id="clearCacheConfirmBtn" type="button" class="storage-button">Clear selected cache</button>
+          </div>
+        </section>
+      </div>
     </main>
 
     <script src="./renderer.js"></script>

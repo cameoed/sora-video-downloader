@@ -32,7 +32,6 @@ class FileStore {
     this.baseDir = baseDir;
     this.statePath = path.join(baseDir, 'state.json');
     this.runsDir = path.join(baseDir, 'runs');
-    this.logsDir = path.join(baseDir, 'logs');
     this.pendingWrites = new Map();
   }
 
@@ -55,7 +54,6 @@ class FileStore {
   async initialize() {
     await ensureDir(this.baseDir);
     await ensureDir(this.runsDir);
-    await ensureDir(this.logsDir);
   }
 
   async getState() {
@@ -69,6 +67,15 @@ class FileStore {
         castInPosts: [],
         castInDrafts: [],
         characterPosts: {},
+        ownPrompts: [],
+      },
+      cacheResetCatalog: {
+        ownDrafts: 0,
+        ownPosts: 0,
+        castInPosts: 0,
+        castInDrafts: 0,
+        characterPosts: {},
+        ownPrompts: 0,
       },
       savedCatalog: {
         ownDrafts: [],
@@ -76,6 +83,7 @@ class FileStore {
         castInPosts: [],
         castInDrafts: [],
         characterPosts: {},
+        ownPrompts: [],
       },
     });
   }
@@ -123,14 +131,6 @@ class FileStore {
     return readJson(path.join(this.getRunDir(runId), 'items.json'), []);
   }
 
-  async appendLog(runId, line) {
-    if (!runId) return;
-    const safeLine = sanitizeString(String(line || ''), 8192) || String(line || '');
-    const logPath = path.join(this.logsDir, String(runId) + '.log');
-    await ensureDir(path.dirname(logPath));
-    await fs.promises.appendFile(logPath, safeLine + '\n', 'utf8');
-  }
-
   async exportManifest(run, items, format) {
     const targetFormat = sanitizeString(format, 24) || 'manifest';
     const runDir = this.getRunDir(run && run.id);
@@ -151,6 +151,12 @@ class FileStore {
     const filePath = path.join(runDir, filename);
     const lines = targetItems.map((item) => JSON.stringify(buildBackupManifestLine(item))).join('\n');
     await fs.promises.writeFile(filePath, lines ? lines + '\n' : '', 'utf8');
+    return { path: filePath, filename: path.basename(filePath) };
+  }
+
+  async writeFile(filePath, contents) {
+    await ensureDir(path.dirname(filePath));
+    await fs.promises.writeFile(filePath, contents, 'utf8');
     return { path: filePath, filename: path.basename(filePath) };
   }
 }

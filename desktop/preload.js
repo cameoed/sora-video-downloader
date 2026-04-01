@@ -8,6 +8,8 @@ contextBridge.exposeInMainWorld('soraBackupApp', {
   updateSettings: (payload) => ipcRenderer.invoke('settings:update', payload),
   startBackup: (payload) => ipcRenderer.invoke('backup:start', payload),
   cancelBackup: () => ipcRenderer.invoke('backup:cancel'),
+  getClearCacheTargets: () => ipcRenderer.invoke('backup:get-clear-cache-targets'),
+  clearSelectedCaches: (payload) => ipcRenderer.invoke('backup:clear-selected-caches', payload),
   chooseDownloadFolder: (currentPath) => ipcRenderer.invoke('backup:choose-download-folder', currentPath),
   openRunFolder: (runId) => ipcRenderer.invoke('backup:open-run-folder', runId),
   onBackupStatus: (callback) => {

@@ -1,16 +1,14 @@
-/*
- * Shared bulk-backup logic for the Sora Video Downloader runtime + tests.
- */
 (function initUVBackupLogic(globalScope) {
   'use strict';
 
-  const BACKUP_SCOPE_KEYS = ['ownDrafts', 'ownPosts', 'castInPosts', 'castInDrafts', 'characterPosts'];
+  const BACKUP_SCOPE_KEYS = ['ownDrafts', 'ownPosts', 'castInPosts', 'castInDrafts', 'characterPosts', 'ownPrompts'];
   const DEFAULT_BACKUP_SCOPES = Object.freeze({
     ownDrafts: true,
     ownPosts: true,
     castInPosts: false,
     castInDrafts: false,
     characterPosts: false,
+    ownPrompts: false,
   });
   const TERMINAL_RUN_STATUSES = new Set(['completed', 'cancelled', 'failed']);
   const RUN_STATUS_VALUES = new Set([
@@ -56,6 +54,7 @@
       castInPosts: scopes.castInPosts === true,
       castInDrafts: scopes.castInDrafts === true,
       characterPosts: scopes.characterPosts === true,
+      ownPrompts: scopes.ownPrompts === true,
     };
   }
 
@@ -66,6 +65,7 @@
       castInPosts: false,
       castInDrafts: false,
       characterPosts: false,
+      ownPrompts: false,
     };
   }
 

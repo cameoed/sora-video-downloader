@@ -15,6 +15,17 @@ let backupService = null;
 let isQuitting = false;
 const MIN_WINDOW_HEIGHT = 640;
 
+app.userAgentFallback = (function () {
+  const chromeVersion = String(process.versions.chrome || '134.0.0.0');
+  if (process.platform === 'win32') {
+    return 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
+  }
+  if (process.platform === 'linux') {
+    return 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
+  }
+  return 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/' + chromeVersion + ' Safari/537.36';
+}());
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 if (!gotSingleInstanceLock) {
@@ -95,6 +106,8 @@ async function setupIpc() {
   ipcMain.handle('settings:update', async (_event, payload) => ({ ok: true, settings: await backupService.updateSettings(payload || {}) }));
   ipcMain.handle('backup:start', async (_event, payload) => backupService.startBackup(payload || {}));
   ipcMain.handle('backup:cancel', async () => backupService.cancelBackup());
+  ipcMain.handle('backup:get-clear-cache-targets', async () => backupService.getClearCacheTargets());
+  ipcMain.handle('backup:clear-selected-caches', async (_event, payload) => backupService.clearSelectedCaches(payload || {}));
   ipcMain.handle('backup:choose-download-folder', async (_event, currentPath) => {
     const parentWindow = getMainWindow();
     const result = await dialog.showOpenDialog(parentWindow, {

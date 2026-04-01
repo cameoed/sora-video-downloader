@@ -15,6 +15,8 @@ function waitMs(ms) {
   return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
 }
 
+const CHATGPT_SESSION_URL = 'https://chatgpt.com/api/auth/session';
+
 function buildChromeLikeUserAgent() {
   const chromeVersion = String(process.versions.chrome || '134.0.0.0');
   if (process.platform === 'win32') {
@@ -58,6 +60,16 @@ class PlaywrightSession {
       } catch {}
       callback({ cancel: false, requestHeaders: details.requestHeaders });
     });
+    const chromeVersion = String(process.versions.chrome || '134.0.0.0').split('.')[0];
+    const chUA = '"Google Chrome";v="' + chromeVersion + '", "Chromium";v="' + chromeVersion + '", "Not:A-Brand";v="99"';
+    const chPlatform = process.platform === 'win32' ? '"Windows"' : '"macOS"';
+    ses.webRequest.onBeforeSendHeaders({ urls: ['https://*.google.com/*', 'https://google.com/*'] }, (details, callback) => {
+      const headers = Object.assign({}, details.requestHeaders);
+      headers['sec-ch-ua'] = chUA;
+      headers['sec-ch-ua-mobile'] = '?0';
+      headers['sec-ch-ua-platform'] = chPlatform;
+      callback({ cancel: false, requestHeaders: headers });
+    });
   }
 
   captureAuthHeaders(rawHeaders) {
@@ -72,12 +84,67 @@ class PlaywrightSession {
     return Object.assign({}, this.capturedHeaders);
   }
 
+  async refreshAuthHeadersFromSession() {
+    const ses = this.getSession();
+    try {
+      const response = await ses.fetch(CHATGPT_SESSION_URL, {
+        method: 'GET',
+        credentials: 'include',
+        cache: 'no-store',
+        headers: {
+          Accept: 'application/json',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+        },
+      });
+      const text = await response.text();
+      let json = null;
+      try {
+        json = text ? JSON.parse(text) : null;
+      } catch (_error) {}
+      const accessToken = sanitizeString(
+        json && typeof json === 'object'
+          ? (json.accessToken || json.access_token || '')
+          : '',
+        16384
+      );
+      if (!response.ok || !accessToken) {
+        return {
+          ok: false,
+          status: Number(response.status) || 0,
+          error: !response.ok
+            ? (typeof text === 'string' ? text.slice(0, 512) : '')
+            : 'backup_missing_auth_header',
+        };
+      }
+      this.captureAuthHeaders({
+        Authorization: /^Bearer\s+/i.test(accessToken) ? accessToken : ('Bearer ' + accessToken),
+        'OAI-Language': this.acceptLanguages,
+      });
+      return { ok: true, headers: this.getCapturedHeaders() };
+    } catch (error) {
+      return {
+        ok: false,
+        status: 0,
+        error: String((error && error.message) || error || 'backup_missing_auth_header'),
+      };
+    }
+  }
+
   async waitForAuthHeaders(timeoutMs) {
     const timeout = Math.max(0, Number(timeoutMs) || 0);
     const startedAt = Date.now();
     while (!this.capturedHeaders.Authorization && (Date.now() - startedAt) < timeout) {
       await waitMs(120);
     }
+    return this.getCapturedHeaders();
+  }
+
+  async ensureAuthHeaders(timeoutMs) {
+    if (this.capturedHeaders.Authorization) return this.getCapturedHeaders();
+    if (timeoutMs > 0) await this.waitForAuthHeaders(timeoutMs);
+    if (this.capturedHeaders.Authorization) return this.getCapturedHeaders();
+    await this.refreshAuthHeadersFromSession();
     return this.getCapturedHeaders();
   }
 
@@ -163,9 +230,7 @@ class PlaywrightSession {
   }
 
   async checkAuth() {
-    if (!this.capturedHeaders.Authorization && this.loginWindow && !this.loginWindow.isDestroyed()) {
-      await this.waitForAuthHeaders(2500);
-    }
+    await this.ensureAuthHeaders(this.loginWindow && !this.loginWindow.isDestroyed() ? 2500 : 0);
     const response = await this.fetchJson('/backend/project_y/v2/me', {}, { maxAttempts: 1, throwOnError: false });
     const user = response.ok ? normalizeCurrentUser(response.json) : { handle: '', id: '' };
     return {
@@ -219,19 +284,7 @@ class PlaywrightSession {
     const queryParams = params || {};
     const settings = options || {};
     const ses = this.getSession();
-    const authHeaders = this.getCapturedHeaders();
-    if (!authHeaders.Authorization) {
-      const missingAuthResponse = {
-        ok: false,
-        status: 0,
-        json: null,
-        error: 'backup_missing_auth_header',
-        retryAfter: '',
-        contentType: '',
-      };
-      if (settings.throwOnError === false) return missingAuthResponse;
-      throw new Error(missingAuthResponse.error);
-    }
+    const authHeaders = await this.ensureAuthHeaders(0);
     const maxAttempts = Math.max(1, Number(settings.maxAttempts) || BACKUP_FETCH_MAX_ATTEMPTS);
     let lastResponse = { ok: false, status: 0, error: 'backup_page_fetch_failed' };
 

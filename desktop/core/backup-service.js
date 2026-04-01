@@ -35,6 +35,7 @@ const {
   extractItemsFromPayload,
   extractCursorFromPayload,
   getBackupItemId,
+  makeBackupItemKey,
   buildBackupFolderName,
   buildBackupFilename,
   buildBackupManifestItem,
@@ -45,7 +46,165 @@ const {
   sanitizeString,
 } = require('./helpers');
 const WATERMARK_DOWNLOAD_THROTTLE_MS = 3000;
+const COMPLETE_SCAN_BUCKETS = ['ownPosts', 'ownDrafts'];
+const PROMPT_SIMILARITY_THRESHOLD = 0.95;
+
+function normalizePromptForDisplay(value) {
+  return sanitizeString(String(value || '').replace(/\s+/g, ' '), 8192) || '';
+}
+
+function normalizePromptForSimilarity(value) {
+  const base = normalizePromptForDisplay(value);
+  if (!base) return '';
+  return base
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function computePromptSimilarity(left, right) {
+  const a = String(left || '');
+  const b = String(right || '');
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const maxLen = Math.max(a.length, b.length);
+  const minLen = Math.min(a.length, b.length);
+  if (!maxLen) return 1;
+  if ((maxLen - minLen) / maxLen > (1 - PROMPT_SIMILARITY_THRESHOLD)) {
+    return minLen / maxLen;
+  }
+  const previous = new Array(b.length + 1);
+  const current = new Array(b.length + 1);
+  for (let j = 0; j <= b.length; j += 1) previous[j] = j;
+  for (let i = 1; i <= a.length; i += 1) {
+    current[0] = i;
+    let rowMin = current[0];
+    for (let j = 1; j <= b.length; j += 1) {
+      const cost = a.charCodeAt(i - 1) === b.charCodeAt(j - 1) ? 0 : 1;
+      current[j] = Math.min(
+        previous[j] + 1,
+        current[j - 1] + 1,
+        previous[j - 1] + cost
+      );
+      if (current[j] < rowMin) rowMin = current[j];
+    }
+    if (rowMin / maxLen > (1 - PROMPT_SIMILARITY_THRESHOLD)) {
+      return 1 - (rowMin / maxLen);
+    }
+    for (let j = 0; j <= b.length; j += 1) previous[j] = current[j];
+  }
+  return Math.max(0, 1 - (previous[b.length] / maxLen));
+}
+
+function formatPromptCsvDuration(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  if (numeric < 60) return numeric.toFixed(1).replace(/\.0$/, '') + ' sec';
+  const totalSeconds = Math.round(numeric);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return String(hours).padStart(2, '0') + ':' + String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+  }
+  return String(minutes).padStart(2, '0') + ':' + String(seconds).padStart(2, '0');
+}
+
+function formatPromptCsvDate(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  return new Date(numeric > 1e12 ? numeric : numeric * 1000).toISOString();
+}
+
+function escapeCsvValue(value) {
+  const text = String(value == null ? '' : value);
+  if (!/[",\n]/.test(text)) return text;
+  return '"' + text.replace(/"/g, '""') + '"';
+}
+
+function buildPromptCsv(rows) {
+  const lines = [
+    '"All draft prompts with similar prompts de-duplicated!"',
+    'Prompt,Duration,Creation Date',
+  ];
+  for (let index = 0; index < rows.length; index += 1) {
+    const row = rows[index];
+    lines.push([
+      escapeCsvValue(row.prompt),
+      escapeCsvValue(row.duration),
+      escapeCsvValue(row.createdAt),
+    ].join(','));
+  }
+  return lines.join('\n') + '\n';
+}
+
+function createEmptyCompleteScanCatalog() {
+  return { ownPosts: null, ownDrafts: null };
+}
+
+function normalizeCompleteScanEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const runId = typeof raw.runId === 'string' && raw.runId ? raw.runId : null;
+  const completedAt = Number.isFinite(Number(raw.completedAt)) && Number(raw.completedAt) > 0
+    ? Math.floor(Number(raw.completedAt))
+    : 0;
+  if (!runId || !completedAt) return null;
+  return { runId, completedAt };
+}
+
+function normalizeCompleteScanCatalog(raw) {
+  const source = raw && typeof raw === 'object' ? raw : {};
+  return {
+    ownPosts: normalizeCompleteScanEntry(source.ownPosts),
+    ownDrafts: normalizeCompleteScanEntry(source.ownDrafts),
+  };
+}
 const VIDEO_PROCESS_RETRY_COUNT = 2;
+const CLEARABLE_CACHE_BUCKETS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts'];
+const CLEARABLE_CACHE_LABELS = {
+  ownPosts: 'My posts',
+  ownDrafts: 'My drafts',
+  castInPosts: 'Cast-in posts',
+  castInDrafts: 'Drafts of me',
+};
+
+function createEmptyCacheResetCatalog() {
+  return {
+    ownDrafts: 0,
+    ownPosts: 0,
+    castInPosts: 0,
+    castInDrafts: 0,
+    characterPosts: {},
+    ownPrompts: 0,
+  };
+}
+
+function normalizeCacheResetTimestamp(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
+}
+
+function normalizeCacheResetCatalog(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = createEmptyCacheResetCatalog();
+  normalized.ownDrafts = normalizeCacheResetTimestamp(source.ownDrafts);
+  normalized.ownPosts = normalizeCacheResetTimestamp(source.ownPosts);
+  normalized.castInPosts = normalizeCacheResetTimestamp(source.castInPosts);
+  normalized.castInDrafts = normalizeCacheResetTimestamp(source.castInDrafts);
+  normalized.ownPrompts = normalizeCacheResetTimestamp(source.ownPrompts);
+  const rawCharacters = source.characterPosts && typeof source.characterPosts === 'object' && !Array.isArray(source.characterPosts)
+    ? source.characterPosts
+    : {};
+  Object.keys(rawCharacters).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    if (!normalizedHandle) return;
+    normalized.characterPosts[normalizedHandle] = normalizeCacheResetTimestamp(rawCharacters[handle]);
+  });
+  return normalized;
+}
 
 class BackupCancelledError extends Error {
   constructor() {
@@ -86,23 +245,121 @@ class BackupService extends EventEmitter {
     this.state.settings = settings;
     this.state.bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
     this.state.savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    this.state.cacheResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
+    this.state.completeScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
     await this._hydrateSavedCatalogFromRuns();
     await this.store.saveState(this.state);
   }
 
   async getBootstrap() {
     const lastRunId = this.state && this.state.lastRunId;
+    const runRecord = this.currentJob
+      ? this.currentJob.run
+      : await this.store.getRun(lastRunId);
+    if (!this.currentJob && runRecord && !isTerminalRunStatus(runRecord.status)) {
+      await this._resetStaleRunForBootstrap(runRecord);
+    }
     const run = this.currentJob
       ? summarizeBackupRun(this.currentJob.run)
-      : await this.store.getRun(lastRunId);
+      : (!runRecord || isTerminalRunStatus(runRecord.status))
+        ? null
+        : summarizeBackupRun(runRecord);
     const items = this.currentJob
       ? this.currentJob.items
-      : await this.store.getItems(lastRunId);
+      : run
+        ? await this.store.getItems(lastRunId)
+        : [];
     return {
       settings: Object.assign({}, this.state.settings),
       session: Object.assign({ authenticated: false, checkedAt: 0, user: null }, this.state.session || {}),
       run: run,
       bucket_progress: this._buildBucketProgressSnapshot(run, items || [], this.state.settings),
+    };
+  }
+
+  async getClearCacheTargets() {
+    return {
+      ok: true,
+      targets: this._buildClearCacheTargets(),
+    };
+  }
+
+  async _resetStaleRunForBootstrap(runRecord) {
+    if (!runRecord || isTerminalRunStatus(runRecord.status)) return;
+    const now = Date.now();
+    runRecord.status = 'cancelled';
+    runRecord.cancelled_at = now;
+    runRecord.updated_at = now;
+    runRecord.active_item_key = '';
+    runRecord.summary_text = 'Backup cancelled.';
+    await this.store.saveRun(runRecord);
+  }
+
+  async clearSelectedCaches(payload) {
+    if (this.currentJob && !isTerminalRunStatus(this.currentJob.run && this.currentJob.run.status)) {
+      return { ok: false, error: 'backup_run_in_progress' };
+    }
+
+    const rawModes = Array.isArray(payload && payload.modes) ? payload.modes : [];
+    const rawCharacters = Array.isArray(payload && payload.characters) ? payload.characters : [];
+    const modes = Array.from(
+      new Set(
+        rawModes
+          .map((value) => sanitizeString(String(value || ''), 64) || '')
+          .filter((value) => CLEARABLE_CACHE_BUCKETS.indexOf(value) >= 0)
+      )
+    );
+    const characters = Array.from(
+      new Set(
+        rawCharacters
+          .map((value) => normalizeCharacterHandle(value))
+          .filter(Boolean)
+      )
+    ).sort((left, right) => left.localeCompare(right));
+
+    if (!modes.length && !characters.length) {
+      return { ok: false, error: 'backup_cache_clear_empty_selection' };
+    }
+
+    const nextBucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
+    const nextSavedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const nextResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
+    const nextCompleteScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
+    const resetAt = Date.now();
+
+    for (let index = 0; index < modes.length; index += 1) {
+      const bucketKey = modes[index];
+      nextBucketCatalog[bucketKey] = [];
+      nextSavedCatalog[bucketKey] = [];
+      nextResetCatalog[bucketKey] = resetAt;
+      if (Object.prototype.hasOwnProperty.call(nextCompleteScanCatalog, bucketKey)) {
+        nextCompleteScanCatalog[bucketKey] = null;
+      }
+    }
+
+    for (let index = 0; index < characters.length; index += 1) {
+      const handle = characters[index];
+      delete nextBucketCatalog.characterPosts[handle];
+      delete nextSavedCatalog.characterPosts[handle];
+      nextResetCatalog.characterPosts[handle] = resetAt;
+    }
+
+    this.state.bucketCatalog = nextBucketCatalog;
+    this.state.savedCatalog = nextSavedCatalog;
+    this.state.cacheResetCatalog = nextResetCatalog;
+    this.state.completeScanCatalog = nextCompleteScanCatalog;
+    await this.store.saveState(this.state);
+    const bootstrap = await this.getBootstrap();
+    bootstrap.bucket_progress = this._buildBucketProgressSnapshot(null, [], this.state.settings);
+
+    return {
+      ok: true,
+      cleared: {
+        modes: modes,
+        characters: characters,
+      },
+      targets: this._buildClearCacheTargets(),
+      bootstrap: bootstrap,
     };
   }
 
@@ -135,11 +392,9 @@ class BackupService extends EventEmitter {
   }
 
   async shutdown() {
-    if (this.currentJob && !isTerminalRunStatus(this.currentJob.run.status)) {
-      await this.cancelBackup().catch(() => {});
-      if (this.currentJobPromise) {
-        await this.currentJobPromise.catch(() => {});
-      }
+    await this.cancelBackup().catch(() => {});
+    if (this.currentJobPromise) {
+      await this.currentJobPromise.catch(() => {});
     }
     await this.session.close();
   }
@@ -247,12 +502,38 @@ class BackupService extends EventEmitter {
     return path.join(run.download_dir || this.state.settings.downloadDir, BACKUP_DOWNLOAD_FOLDER, buildBackupFolderName(run, bucketKey));
   }
 
+  _isPromptExportRun(run) {
+    const scopes = normalizeBackupScopes(run && run.scopes);
+    return scopes.ownPrompts === true;
+  }
+
   async _runBackup(job) {
     try {
       await this._discover(job);
       if (job.cancelRequested) throw new BackupCancelledError();
 
       await this.store.saveItems(job.run.id, job.items);
+
+      if (this._isPromptExportRun(job.run)) {
+        job.run.status = 'running';
+        job.run.summary_text = 'Discovery complete. Preparing prompts CSV...';
+        job.run.updated_at = Date.now();
+        await this.store.saveRun(job.run);
+        this._emitStatus(job);
+        const promptExport = await this._exportPromptCsv(job);
+        if (job.cancelRequested) throw new BackupCancelledError();
+        job.run.status = 'completed';
+        job.run.completed_at = Date.now();
+        job.run.updated_at = Date.now();
+        job.run.active_item_key = '';
+        job.run.summary_text = 'Prompt export complete. ' + promptExport.uniqueCount + ' unique prompts saved, ' + promptExport.skippedCount + ' skipped.';
+        await this._persistJob(job, true);
+        await this.store.exportManifest(job.run, job.items, 'manifest');
+        await this.store.exportManifest(job.run, job.items, 'failures');
+        await this.store.exportManifest(job.run, job.items, 'summary');
+        this._emitStatus(job);
+        return;
+      }
 
       if ((Number(job.run.counts.queued) || 0) > 0) {
         job.run.status = 'running';
@@ -312,6 +593,26 @@ class BackupService extends EventEmitter {
       job.run.updated_at = Date.now();
       await this.store.saveRun(job.run);
       this._emitStatus(job);
+
+      if (COMPLETE_SCAN_BUCKETS.indexOf(bucket.key) >= 0) {
+        const cached = this.state.completeScanCatalog && this.state.completeScanCatalog[bucket.key];
+        if (cached && cached.runId && cached.runId !== job.run.id) {
+          job.run.summary_text = 'Loading cached ' + bucket.key + ' from previous scan…';
+          job.run.updated_at = Date.now();
+          await this.store.saveRun(job.run);
+          this._emitStatus(job);
+          const loaded = await this._loadCachedBucketItems(job, bucket, cached.runId, order);
+          if (loaded > 0) {
+            order += loaded;
+            await this._refreshBucketCatalog(job);
+            job.run.summary_text = 'Loaded ' + loaded + ' cached ' + bucket.key + ' items (skipped re-scan).';
+            job.run.updated_at = Date.now();
+            await this.store.saveRun(job.run);
+            this._emitStatus(job);
+            continue;
+          }
+        }
+      }
 
       let cursor = null;
       let pageNumber = 0;
@@ -382,7 +683,113 @@ class BackupService extends EventEmitter {
           cursor = null;
         }
       } while (cursor);
+
+      if (COMPLETE_SCAN_BUCKETS.indexOf(bucket.key) >= 0) {
+        if (!this.state.completeScanCatalog) this.state.completeScanCatalog = createEmptyCompleteScanCatalog();
+        this.state.completeScanCatalog[bucket.key] = { runId: job.run.id, completedAt: Date.now() };
+        await this.store.saveState(this.state);
+      }
     }
+  }
+
+  async _loadCachedBucketItems(job, bucket, runId, startOrder) {
+    try {
+      const cachedItems = await this.store.getItems(runId);
+      const bucketItems = (cachedItems || []).filter((item) => item && item.bucket === bucket.key);
+      if (!bucketItems.length) return 0;
+      let count = 0;
+      for (let i = 0; i < bucketItems.length; i += 1) {
+        const source = bucketItems[i];
+        const dedupeKey = source.kind + ':' + source.id;
+        if (job.seenKeys.has(dedupeKey)) continue;
+        job.seenKeys.add(dedupeKey);
+        if (this._isAlreadySaved(job, bucket.key, source.id)) continue;
+        const item = Object.assign({}, source, {
+          item_key: makeBackupItemKey(job.run.id, source.kind, source.id),
+          run_id: job.run.id,
+          order: startOrder + count,
+          status: 'queued',
+          attempts: 0,
+          last_error: '',
+          filename: buildBackupFilename(job.run, source.bucket, source.id, source.media_ext),
+        });
+        job.items.push(item);
+        job.run.counts.discovered += 1;
+        job.run.bucket_counts[bucket.key] = (Number(job.run.bucket_counts[bucket.key]) || 0) + 1;
+        job.run.counts = applyBackupStatusTransition(job.run.counts, null, item.status);
+        count += 1;
+      }
+      return count;
+    } catch (_err) {
+      return 0;
+    }
+  }
+
+  async _exportPromptCsv(job) {
+    const uniqueRows = [];
+    const accepted = [];
+
+    for (let index = 0; index < job.items.length; index += 1) {
+      this._throwIfCancelled(job);
+      const item = job.items[index];
+      const displayPrompt = normalizePromptForDisplay(item && item.prompt);
+      if (!displayPrompt) {
+        this._transitionItem(job, item, 'skipped', {
+          last_error: 'missing_prompt',
+        });
+        continue;
+      }
+
+      const similarityPrompt = normalizePromptForSimilarity(displayPrompt);
+      let duplicateMatch = null;
+      for (let compareIndex = 0; compareIndex < accepted.length; compareIndex += 1) {
+        const candidate = accepted[compareIndex];
+        const similarity = computePromptSimilarity(similarityPrompt, candidate.similarityPrompt);
+        if (similarity >= PROMPT_SIMILARITY_THRESHOLD) {
+          duplicateMatch = {
+            itemId: candidate.item.id,
+            similarity: similarity,
+          };
+          break;
+        }
+      }
+
+      if (duplicateMatch) {
+        this._transitionItem(job, item, 'skipped', {
+          last_error: 'duplicate_prompt_' + duplicateMatch.itemId + '_' + duplicateMatch.similarity.toFixed(2),
+        });
+        continue;
+      }
+
+      accepted.push({
+        item: item,
+        similarityPrompt: similarityPrompt,
+      });
+      uniqueRows.push({
+        prompt: displayPrompt,
+        duration: formatPromptCsvDuration(item.duration_s),
+        createdAt: formatPromptCsvDate(item.created_at),
+      });
+      this._transitionItem(job, item, 'done', {
+        last_error: '',
+      });
+    }
+
+    const bucketKey = 'ownPrompts';
+    const folderPath = path.join(
+      job.run.download_dir || this.state.settings.downloadDir,
+      BACKUP_DOWNLOAD_FOLDER,
+      buildBackupFolderName(job.run, bucketKey)
+    );
+    await fs.promises.mkdir(folderPath, { recursive: true });
+    const csvPath = path.join(folderPath, 'my-prompts.csv');
+    await this.store.writeFile(csvPath, buildPromptCsv(uniqueRows));
+
+    return {
+      path: csvPath,
+      uniqueCount: uniqueRows.length,
+      skippedCount: Math.max(0, job.items.length - uniqueRows.length),
+    };
   }
 
   async _downloadQueuedItems(job) {
@@ -486,8 +893,6 @@ class BackupService extends EventEmitter {
       };
     }
 
-    // Sora sometimes already exposes a direct no-watermark source. Use it and
-    // avoid the external resolver entirely when we already have the right asset.
     if (item.media_variant === 'no_watermark') {
       return {
         providerId: '',
@@ -635,18 +1040,11 @@ class BackupService extends EventEmitter {
       try {
         await this._processVideo(job, inputPath, outputPath, requestedOptions);
         await this._removeFileIfPresent(inputPath);
-        if (attempt > 1) {
-          await this._appendRunLog(job, '[' + item.id + '] FFmpeg retry succeeded with requested settings.');
-        }
         return {
           itemOverrides: { last_error: '' },
         };
       } catch (error) {
         await this._removeFileIfPresent(outputPath);
-        await this._appendRunLog(
-          job,
-          '[' + item.id + '] FFmpeg attempt ' + attempt + '/' + VIDEO_PROCESS_RETRY_COUNT + ' failed: ' + this._formatErrorMessage(error)
-        );
         if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
           throw new BackupCancelledError();
         }
@@ -658,18 +1056,10 @@ class BackupService extends EventEmitter {
     job.run.summary_text = 'Retrying ' + item.id + ' with safer FFmpeg settings...';
     await this._persistJob(job, false);
     this._emitStatus(job);
-    await this._appendRunLog(
-      job,
-      '[' + item.id + '] Falling back to FFmpeg settings: audio=' + fallbackOptions.audioMode + ', framing=' + fallbackOptions.framingMode + '.'
-    );
     await this._removeFileIfPresent(fallbackOutputPath);
     try {
       await this._processVideo(job, inputPath, fallbackOutputPath, fallbackOptions);
       await this._removeFileIfPresent(inputPath);
-      await this._appendRunLog(
-        job,
-        '[' + item.id + '] Safer FFmpeg fallback succeeded.'
-      );
       return {
         itemOverrides: Object.assign(
           { last_error: 'Requested processing failed twice. Saved with With Audiomark + Default Crop instead.' },
@@ -678,10 +1068,6 @@ class BackupService extends EventEmitter {
       };
     } catch (fallbackError) {
       await this._removeFileIfPresent(fallbackOutputPath);
-      await this._appendRunLog(
-        job,
-        '[' + item.id + '] Safer FFmpeg fallback failed: ' + this._formatErrorMessage(fallbackError)
-      );
       if (job.cancelRequested && String((fallbackError && fallbackError.message) || fallbackError || '') === 'download_cancelled') {
         throw new BackupCancelledError();
       }
@@ -695,10 +1081,6 @@ class BackupService extends EventEmitter {
     await this._removeFileIfPresent(preservedSourcePath);
     await fs.promises.mkdir(path.dirname(preservedSourcePath), { recursive: true });
     await fs.promises.rename(inputPath, preservedSourcePath);
-    await this._appendRunLog(
-      job,
-      '[' + item.id + '] Preserved the original downloaded file after FFmpeg failures.'
-    );
     return {
       itemOverrides: Object.assign(
         { last_error: 'FFmpeg failed. Saved the original downloaded video instead.' },
@@ -743,15 +1125,6 @@ class BackupService extends EventEmitter {
     const relativePath = baseDownloadDir ? path.relative(baseDownloadDir, absolutePath) : absolutePath;
     if (!relativePath || relativePath === item.filename) return {};
     return { filename: relativePath };
-  }
-
-  _formatErrorMessage(error) {
-    return sanitizeString(String((error && (error.userMessage || error.message)) || error || 'processing_failed'), 1024) || 'processing_failed';
-  }
-
-  async _appendRunLog(job, message) {
-    if (!job || !job.run || !job.run.id || !message) return;
-    await this.store.appendLog(job.run.id, message).catch(() => {});
   }
 
   async _applyWatermarkDownloadThrottle(job, publishedDownloadMode) {
@@ -1017,6 +1390,7 @@ class BackupService extends EventEmitter {
       ownPosts: new Set(savedCatalog.ownPosts),
       castInPosts: new Set(savedCatalog.castInPosts),
       castInDrafts: new Set(savedCatalog.castInDrafts),
+      ownPrompts: new Set(savedCatalog.ownPrompts),
       characterPosts: new Set(characterHandle ? (savedCatalog.characterPosts[characterHandle] || []) : []),
     };
   }
@@ -1071,16 +1445,92 @@ class BackupService extends EventEmitter {
   async _hydrateSavedCatalogFromRuns() {
     const runIds = await this.store.listRunIds();
     let nextCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const resetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
     for (let index = 0; index < runIds.length; index += 1) {
       const runId = runIds[index];
       const run = await this.store.getRun(runId);
       if (!run) continue;
       const items = await this.store.getItems(runId);
-      const doneItems = (items || []).filter((item) => normalizeItemStatus(item && item.status) === 'done');
+      const doneItems = (items || []).filter((item) => {
+        if (normalizeItemStatus(item && item.status) !== 'done') return false;
+        return this._shouldKeepSavedItemAfterCacheReset(run, item, resetCatalog);
+      });
       if (!doneItems.length) continue;
       nextCatalog = recordBackupItemsInBucketCatalog(nextCatalog, run, doneItems);
     }
     this.state.savedCatalog = nextCatalog;
+  }
+
+  _buildClearCacheTargets() {
+    const modeTargets = CLEARABLE_CACHE_BUCKETS.map((key) => ({
+      key: key,
+      label: CLEARABLE_CACHE_LABELS[key] || key,
+    }));
+    const characterTargets = this._collectHistoricalCharacterHandles().map((handle) => ({
+      key: handle,
+      label: handle && handle.charAt(0) === '@' ? handle : ('@' + handle),
+    }));
+    return {
+      modes: modeTargets,
+      characters: characterTargets,
+    };
+  }
+
+  _collectHistoricalCharacterHandles() {
+    const bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
+    const savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const resetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
+    const bucketHandles = new Set();
+    const savedHandles = new Set();
+    const handles = new Set();
+    Object.keys(bucketCatalog.characterPosts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      handles.add(normalizedHandle);
+      bucketHandles.add(normalizedHandle);
+    });
+    Object.keys(savedCatalog.characterPosts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      handles.add(normalizedHandle);
+      savedHandles.add(normalizedHandle);
+    });
+    Object.keys(resetCatalog.characterPosts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      if (!bucketHandles.has(normalizedHandle) && !savedHandles.has(normalizedHandle)) return;
+      if (!handles.has(normalizedHandle)) handles.add(normalizedHandle);
+    });
+    return Array.from(handles).sort((left, right) => left.localeCompare(right));
+  }
+
+  _getRunTerminalTimestamp(run) {
+    return Math.max(
+      0,
+      Number(run && run.completed_at) || 0,
+      Number(run && run.cancelled_at) || 0,
+      Number(run && run.updated_at) || 0,
+      Number(run && run.started_at) || 0,
+      Number(run && run.created_at) || 0
+    );
+  }
+
+  _getCacheResetTimestampForItem(run, item, resetCatalog) {
+    const bucketKey = sanitizeString(String(item && item.bucket || ''), 64) || '';
+    if (bucketKey === 'characterPosts') {
+      const handle = normalizeCharacterHandle(run && run.settings && run.settings.character_handle);
+      return handle ? normalizeCacheResetTimestamp(resetCatalog && resetCatalog.characterPosts && resetCatalog.characterPosts[handle]) : 0;
+    }
+    if (CLEARABLE_CACHE_BUCKETS.indexOf(bucketKey) >= 0) {
+      return normalizeCacheResetTimestamp(resetCatalog && resetCatalog[bucketKey]);
+    }
+    return 0;
+  }
+
+  _shouldKeepSavedItemAfterCacheReset(run, item, resetCatalog) {
+    const resetAt = this._getCacheResetTimestampForItem(run, item, resetCatalog);
+    if (!resetAt) return true;
+    return this._getRunTerminalTimestamp(run) > resetAt;
   }
 
   _throwIfCancelled(job) {

@@ -67,7 +67,8 @@ function normalizeBackupBucketKey(value) {
     raw === 'ownPosts' ||
     raw === 'castInPosts' ||
     raw === 'castInDrafts' ||
-    raw === 'characterPosts'
+    raw === 'characterPosts' ||
+    raw === 'ownPrompts'
   ) {
     return raw;
   }
@@ -82,6 +83,7 @@ function cloneBackupBucketCounts(raw) {
     castInPosts: Number(source.castInPosts) || 0,
     castInDrafts: Number(source.castInDrafts) || 0,
     characterPosts: Number(source.characterPosts) || 0,
+    ownPrompts: Number(source.ownPrompts) || 0,
   };
 }
 
@@ -92,6 +94,7 @@ function createEmptyBackupBucketCatalog() {
     castInPosts: [],
     castInDrafts: [],
     characterPosts: {},
+    ownPrompts: [],
   };
 }
 
@@ -109,6 +112,9 @@ function normalizeBackupBucketCatalog(raw) {
     : [];
   normalized.castInDrafts = Array.isArray(source.castInDrafts)
     ? source.castInDrafts.map((value) => sanitizeIdToken(value, 256)).filter(Boolean)
+    : [];
+  normalized.ownPrompts = Array.isArray(source.ownPrompts)
+    ? source.ownPrompts.map((value) => sanitizeIdToken(value, 256)).filter(Boolean)
     : [];
   if (isPlainObject(source.characterPosts)) {
     Object.keys(source.characterPosts).forEach((handle) => {
@@ -130,6 +136,7 @@ function recordBackupItemsInBucketCatalog(catalog, run, items) {
     ownPosts: new Set(nextCatalog.ownPosts),
     castInPosts: new Set(nextCatalog.castInPosts),
     castInDrafts: new Set(nextCatalog.castInDrafts),
+    ownPrompts: new Set(nextCatalog.ownPrompts),
   };
   const characterSets = {};
   Object.keys(nextCatalog.characterPosts).forEach((handle) => {
@@ -156,6 +163,7 @@ function recordBackupItemsInBucketCatalog(catalog, run, items) {
     ownPosts: Array.from(bucketSets.ownPosts),
     castInPosts: Array.from(bucketSets.castInPosts),
     castInDrafts: Array.from(bucketSets.castInDrafts),
+    ownPrompts: Array.from(bucketSets.ownPrompts),
     characterPosts: Object.keys(characterSets).reduce((acc, handle) => {
       acc[handle] = Array.from(characterSets[handle]);
       return acc;
@@ -171,6 +179,7 @@ function buildBackupHistoricalBucketCounts(catalog, settings) {
     ownPosts: normalizedCatalog.ownPosts.length,
     castInPosts: normalizedCatalog.castInPosts.length,
     castInDrafts: normalizedCatalog.castInDrafts.length,
+    ownPrompts: normalizedCatalog.ownPrompts.length,
     characterPosts: characterHandle && Array.isArray(normalizedCatalog.characterPosts[characterHandle])
       ? normalizedCatalog.characterPosts[characterHandle].length
       : 0,
@@ -182,7 +191,7 @@ function normalizeBackupPublishedMode(value) {
 }
 
 function normalizeBackupAudioMode(value) {
-  return value === 'no_audiomark' ? 'no_audiomark' : 'with_audiomark';
+  return value === 'with_audiomark' ? 'with_audiomark' : 'no_audiomark';
 }
 
 function normalizeBackupFramingMode(value) {
@@ -192,6 +201,8 @@ function normalizeBackupFramingMode(value) {
 function normalizeCharacterHandle(value) {
   const raw = sanitizeString(value, 80) || '';
   if (!raw) return '';
+  const lowered = raw.toLowerCase().replace(/\s+/g, '');
+  if (/^@?togyl$/.test(lowered)) return '@togyl';
   return raw.replace(/^@+/, '').toLowerCase().replace(/[^a-z0-9._-]/g, '').slice(0, 64);
 }
 
@@ -233,6 +244,9 @@ function getSelectedBackupBuckets(scopes, settings) {
   }
   if (normalized.castInDrafts) {
     buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: incrementalBatchLimit });
+  }
+  if (normalized.ownPrompts) {
+    buckets.push({ key: 'ownPrompts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: draftLimit });
   }
   if (normalized.characterPosts && normalizedSettings.character_handle) {
     buckets.push({
@@ -460,8 +474,9 @@ function resolveBackupDimensionsAndDuration(detail, item) {
 
 function buildBackupFolderName(run, bucket) {
   const settings = normalizeBackupRequestSettings(run && run.settings);
+  if (bucket === 'ownPrompts') return 'My Sora Prompts';
   const watermarkLabel = settings.published_download_mode === 'direct_sora' ? 'With Watermark' : 'No Watermark';
-  const audiomarkLabel = settings.audio_mode === 'with_audiomark' ? 'Yes Audiomark' : 'No Audiomark';
+  const audiomarkLabel = settings.audio_mode === 'with_audiomark' ? 'With Label' : 'No Label';
   const framingLabel = settings.framing_mode === 'social_16_9' ? '16:9 for Social' : 'Default Crop';
   let folderPrefix = bucket;
   if (bucket === 'ownPosts') folderPrefix = 'My Sora Posts';
@@ -470,13 +485,17 @@ function buildBackupFolderName(run, bucket) {
   else if (bucket === 'castInDrafts') folderPrefix = 'Sora Drafts of Me';
   else if (bucket === 'characterPosts') {
     const handle = normalizeCharacterHandle(settings.character_handle);
-    folderPrefix = handle ? ('@' + handle + ' Sora Posts') : 'Character Sora Posts';
+    folderPrefix = handle ? ((handle.charAt(0) === '@' ? handle : ('@' + handle)) + ' Sora Posts') : 'Character Sora Posts';
   }
   return folderPrefix + ' - ' + watermarkLabel + ', ' + audiomarkLabel + ', ' + framingLabel;
 }
 
 function buildBackupFilename(run, bucket, id, ext) {
   const settings = normalizeBackupRequestSettings(run && run.settings);
+  if (bucket === 'ownPrompts') {
+    const folderName = buildBackupFolderName(run, bucket);
+    return path.join(BACKUP_DOWNLOAD_FOLDER, folderName, 'my-prompts.csv');
+  }
   let safeExt = sanitizeString(ext, 16) || 'mp4';
   if (settings.audio_mode === 'no_audiomark') safeExt = 'mov';
   else if (settings.framing_mode === 'social_16_9') safeExt = 'mp4';
@@ -511,6 +530,7 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
   const castNames = collectBackupCastNames(detail, listItem);
   const media = pickBackupMediaSource(kind, detail || listItem);
   const mediaExt = (media && media.ext) || 'mp4';
+  const isPromptBucket = bucket === 'ownPrompts';
   return {
     item_key: makeBackupItemKey(run.id, kind, id),
     run_id: run.id,
@@ -540,7 +560,7 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
     media_variant: (media && media.variant) || '',
     media_ext: mediaExt,
     media_key_path: (media && media.keyPath) || '',
-    filename: buildBackupFilename(run, bucket, id, mediaExt),
+    filename: isPromptBucket ? '' : buildBackupFilename(run, bucket, id, mediaExt),
     url_refreshed_at: media && media.url ? Date.now() : 0,
     last_error: '',
   };
@@ -651,6 +671,7 @@ function createEmptyBackupBucketProgressSnapshot() {
       castInPosts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
       castInDrafts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
       characterPosts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
+      ownPrompts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
     },
   };
 }
