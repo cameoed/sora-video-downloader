@@ -133,7 +133,7 @@ async function setupIpc() {
 
 async function boot() {
   backupService = new BackupService({
-    baseDir: path.join(app.getPath('userData'), 'sora-backup-app'),
+    baseDir: path.join(app.getPath('userData'), 'sora-video-downloader'),
     defaultDownloadDir: app.getPath('downloads'),
   });
   await backupService.initialize();
@@ -153,7 +153,7 @@ if (gotSingleInstanceLock) {
 
   app.whenReady().then(boot).catch((error) => {
     dialog.showErrorBox(
-      'Sora Backup App Failed To Start',
+      'Sora Video Downloader Failed To Start',
       String((error && error.stack) || (error && error.message) || error || 'Unknown startup error.')
     );
     app.quit();

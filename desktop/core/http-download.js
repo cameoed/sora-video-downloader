@@ -13,7 +13,7 @@ const KONTEN_SMART_DOWNLOAD_HEADERS = {
 };
 const SORAVDL_PROXY_BASE = 'https://soravdl.com/api/proxy/video/';
 const DEFAULT_DOWNLOAD_HEADERS = {
-  'user-agent': 'Sora Backup App',
+  'user-agent': 'Sora Video Downloader',
 };
 const REQUEST_BUFFER_TIMEOUT_MS = 15000;
 const DOWNLOAD_SOCKET_TIMEOUT_MS = 20000;

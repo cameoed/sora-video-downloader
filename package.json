@@ -1,8 +1,8 @@
 {
-  "name": "sora-backup-app",
-  "version": "0.1.1",
+  "name": "sora-video-downloader",
+  "version": "1.0.0",
   "private": true,
-  "description": "Desktop Sora video downloader for macOS and Windows using Electron.",
+  "description": "Desktop Sora Video Downloader for macOS and Windows using Electron.",
   "main": "desktop/main.js",
   "scripts": {
     "prepare:icons": "node desktop/scripts/prepare-icons.js",
@@ -13,7 +13,7 @@
     "dist:win": "node desktop/scripts/prepare-release.js win && electron-builder --win nsis --x64 --publish never"
   },
   "build": {
-    "appId": "com.sora.backup.app",
+    "appId": "com.sora.video.downloader",
     "productName": "Sora Video Downloader",
     "asar": true,
     "directories": {
