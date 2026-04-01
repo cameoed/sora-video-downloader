@@ -1,10 +1,11 @@
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
+const { randomInt } = require('crypto');
 const { FileStore } = require('./file-store');
 const { PlaywrightSession } = require('./playwright-session');
-const { downloadToFile, resolveSmartDownloadUrl } = require('./http-download');
-const { resolveFfmpegBinary, removeAudiomark, buildIntermediateDownloadPath } = require('./media-processing');
+const { downloadToFile, getSmartDownloadProviders, resolveSmartDownloadRequest } = require('./http-download');
+const { resolveFfmpegBinary, processVideo, buildIntermediateDownloadPath } = require('./media-processing');
 const {
   BACKUP_URL_REFRESH_MAX_AGE_MS,
   BACKUP_DOWNLOAD_FOLDER,
@@ -12,6 +13,7 @@ const {
   normalizeBackupScopes,
   normalizeBackupRequestSettings,
   normalizeBackupAudioMode,
+  normalizeBackupFramingMode,
   normalizeCharacterHandle,
   normalizeCurrentUser,
   extractOwnerIdentity,
@@ -42,6 +44,8 @@ const {
   pickTitle,
   sanitizeString,
 } = require('./helpers');
+const WATERMARK_DOWNLOAD_THROTTLE_MS = 3000;
+const VIDEO_PROCESS_RETRY_COUNT = 2;
 
 class BackupCancelledError extends Error {
   constructor() {
@@ -49,6 +53,8 @@ class BackupCancelledError extends Error {
     this.name = 'BackupCancelledError';
   }
 }
+
+const SMART_DOWNLOAD_OVERLOADED_MESSAGE = 'All watermark removers are overloaded right now. Please try again later.';
 
 class BackupService extends EventEmitter {
   constructor(options) {
@@ -72,6 +78,7 @@ class BackupService extends EventEmitter {
     if (!settings.downloadDir) settings.downloadDir = this.defaultDownloadDir;
     if (!settings.published_download_mode) settings.published_download_mode = 'smart';
     settings.audio_mode = normalizeBackupAudioMode(settings.audio_mode);
+    settings.framing_mode = normalizeBackupFramingMode(settings.framing_mode);
     if (!settings.selectedScope) settings.selectedScope = 'ownPosts';
     if (!settings.character_handle) settings.character_handle = '';
     delete settings.profile;
@@ -102,6 +109,7 @@ class BackupService extends EventEmitter {
   async updateSettings(partial) {
     const nextSettings = Object.assign({}, this.state.settings, partial || {});
     nextSettings.audio_mode = normalizeBackupAudioMode(nextSettings.audio_mode);
+    nextSettings.framing_mode = normalizeBackupFramingMode(nextSettings.framing_mode);
     delete nextSettings.profile;
     this.state.settings = nextSettings;
     await this.store.saveState(this.state);
@@ -148,6 +156,7 @@ class BackupService extends EventEmitter {
       downloadDir: settings.downloadDir,
       published_download_mode: settings.published_download_mode,
       audio_mode: settings.audio_mode,
+      framing_mode: settings.framing_mode,
       character_handle: settings.character_handle,
       selectedScope: Object.keys(scopes).find((key) => scopes[key] === true) || 'ownPosts',
     });
@@ -165,6 +174,7 @@ class BackupService extends EventEmitter {
       items: [],
       seenKeys: new Set(),
       savedIds: this._buildSavedIdSetsForRun(run),
+      smartDownload: this._createSmartDownloadState(settings.published_download_mode),
       cancelRequested: false,
       dirtyItemWrites: 0,
     };
@@ -377,14 +387,21 @@ class BackupService extends EventEmitter {
 
   async _downloadQueuedItems(job) {
     const audioMode = normalizeBackupAudioMode(job && job.run && job.run.settings && job.run.settings.audio_mode);
+    const framingMode = normalizeBackupFramingMode(job && job.run && job.run.settings && job.run.settings.framing_mode);
     const publishedDownloadMode = job && job.run && job.run.settings && job.run.settings.published_download_mode;
-    for (let index = 0; index < job.items.length; index += 1) {
-      const item = job.items[index];
+    const shouldProcessVideo = audioMode === 'no_audiomark' || framingMode === 'social_16_9';
+    let index = 0;
+    while (true) {
+      const nextEntry = this._takeNextQueuedItem(job, index);
+      if (!nextEntry) break;
+      const item = nextEntry.item;
+      index = nextEntry.nextIndex;
       if (normalizeItemStatus(item.status) !== 'queued') continue;
       this._throwIfCancelled(job);
 
       const preparedItem = await this._refreshBackupItemMedia(job.run, item);
       if (!preparedItem.media_url) {
+        this._clearSmartDownloadRetryState(job, preparedItem);
         this._transitionItem(job, preparedItem, 'failed', {
           last_error: preparedItem.last_error || 'missing_media_url',
         });
@@ -402,36 +419,92 @@ class BackupService extends EventEmitter {
       this._emitStatus(job);
 
       const destinationPath = path.join(job.run.download_dir || this.state.settings.downloadDir, preparedItem.filename);
-      const tempDownloadPath =
-        audioMode === 'no_audiomark'
-          ? buildIntermediateDownloadPath(destinationPath, preparedItem.media_ext)
-          : destinationPath;
+      const tempDownloadPath = shouldProcessVideo
+        ? buildIntermediateDownloadPath(destinationPath, preparedItem.media_ext)
+        : destinationPath;
+      let downloadRequest = null;
+      let doneOverrides = { last_error: '' };
       try {
-        const downloadUrl =
-          publishedDownloadMode === 'smart' && preparedItem.kind === 'published'
-            ? await resolveSmartDownloadUrl(preparedItem.post_permalink || '', { signal: this._createActiveAbortSignal() })
-            : preparedItem.media_url;
-        await downloadToFile(downloadUrl, tempDownloadPath, { signal: this._createActiveAbortSignal() });
-        if (audioMode === 'no_audiomark') {
-          job.run.summary_text = 'Removing audiomark from ' + preparedItem.id + '...';
+        downloadRequest = await this._resolveDownloadRequest(job, preparedItem, publishedDownloadMode);
+        await this._applyWatermarkDownloadThrottle(job, publishedDownloadMode);
+        await downloadToFile(downloadRequest.url, tempDownloadPath, {
+          acceptVideoOnErrorStatus: downloadRequest.acceptVideoOnErrorStatus,
+          headers: downloadRequest.headers,
+          signal: this._createActiveAbortSignal(),
+        });
+        if (shouldProcessVideo) {
+          job.run.summary_text = this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode);
           await this._persistJob(job, false);
           this._emitStatus(job);
-          await this._removeAudiomark(job, tempDownloadPath, destinationPath);
-          await this._removeFileIfPresent(tempDownloadPath);
+          const processingOutcome = await this._processVideoWithRecovery(job, preparedItem, tempDownloadPath, destinationPath, {
+            audioMode: audioMode,
+            framingMode: framingMode,
+            width: preparedItem.width,
+            height: preparedItem.height,
+          });
+          doneOverrides = processingOutcome && processingOutcome.itemOverrides
+            ? processingOutcome.itemOverrides
+            : doneOverrides;
         }
-        this._transitionItem(job, preparedItem, 'done', { last_error: '' });
+        this._resetSmartDownloadFailures(job, preparedItem);
+        this._transitionItem(job, preparedItem, 'done', doneOverrides);
       } catch (error) {
-        if (audioMode === 'no_audiomark') {
+        if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
+          throw new BackupCancelledError();
+        }
+        if (shouldProcessVideo) {
           await this._removeFileIfPresent(tempDownloadPath);
           await this._removeFileIfPresent(destinationPath);
         }
+        const handledSmartFailure = this._handleSmartDownloadFailure(job, preparedItem, error, downloadRequest, publishedDownloadMode);
+        if (handledSmartFailure) {
+          await this._persistJob(job, false);
+          this._emitStatus(job);
+          continue;
+        }
+        this._clearSmartDownloadRetryState(job, preparedItem);
         this._transitionItem(job, preparedItem, 'failed', {
-          last_error: sanitizeString(String((error && error.message) || error || 'download_failed'), 1024) || 'download_failed',
+          last_error: sanitizeString(String((error && (error.userMessage || error.message)) || error || 'download_failed'), 1024) || 'download_failed',
         });
       }
 
       await this._persistJob(job, false);
       this._emitStatus(job);
+    }
+  }
+
+  async _resolveDownloadRequest(job, item, publishedDownloadMode) {
+    if (!item || !item.media_url) {
+      throw new Error('missing_media_url');
+    }
+
+    if (publishedDownloadMode !== 'smart' || item.kind !== 'published') {
+      return {
+        providerId: '',
+        url: item.media_url,
+        headers: {},
+      };
+    }
+
+    // Sora sometimes already exposes a direct no-watermark source. Use it and
+    // avoid the external resolver entirely when we already have the right asset.
+    if (item.media_variant === 'no_watermark') {
+      return {
+        providerId: '',
+        url: item.media_url,
+        headers: {},
+      };
+    }
+
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !smartDownload.providers.length) {
+      throw new Error('smart_download_no_providers');
+    }
+    const activeProvider = smartDownload.providers[smartDownload.activeProviderIndex];
+    try {
+      return await resolveSmartDownloadRequest(activeProvider.id, item, { signal: this._createActiveAbortSignal() });
+    } catch (error) {
+      throw this._createSmartProviderError(activeProvider.id, 'resolve', error);
     }
   }
 
@@ -530,13 +603,194 @@ class BackupService extends EventEmitter {
     return this.ffmpegPathPromise;
   }
 
-  async _removeAudiomark(job, inputPath, outputPath) {
+  async _processVideo(job, inputPath, outputPath, options) {
     const ffmpegPath = await this._getFfmpegPath(job);
-    await removeAudiomark({
+    await processVideo({
       ffmpegPath: ffmpegPath,
       inputPath: inputPath,
       outputPath: outputPath,
+      audioMode: options && options.audioMode,
+      framingMode: options && options.framingMode,
+      width: options && options.width,
+      height: options && options.height,
       signal: this._createActiveAbortSignal(),
+    });
+  }
+
+  async _processVideoWithRecovery(job, item, inputPath, outputPath, options) {
+    const requestedOptions = {
+      audioMode: normalizeBackupAudioMode(options && options.audioMode),
+      framingMode: normalizeBackupFramingMode(options && options.framingMode),
+      width: options && options.width,
+      height: options && options.height,
+    };
+
+    for (let attempt = 1; attempt <= VIDEO_PROCESS_RETRY_COUNT; attempt += 1) {
+      if (attempt > 1) {
+        job.run.summary_text = 'Retrying video processing for ' + item.id + '...';
+        await this._persistJob(job, false);
+        this._emitStatus(job);
+      }
+      await this._removeFileIfPresent(outputPath);
+      try {
+        await this._processVideo(job, inputPath, outputPath, requestedOptions);
+        await this._removeFileIfPresent(inputPath);
+        if (attempt > 1) {
+          await this._appendRunLog(job, '[' + item.id + '] FFmpeg retry succeeded with requested settings.');
+        }
+        return {
+          itemOverrides: { last_error: '' },
+        };
+      } catch (error) {
+        await this._removeFileIfPresent(outputPath);
+        await this._appendRunLog(
+          job,
+          '[' + item.id + '] FFmpeg attempt ' + attempt + '/' + VIDEO_PROCESS_RETRY_COUNT + ' failed: ' + this._formatErrorMessage(error)
+        );
+        if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
+          throw new BackupCancelledError();
+        }
+      }
+    }
+
+    const fallbackOptions = this._buildFallbackVideoProcessingOptions(requestedOptions);
+    const fallbackOutputPath = this._buildOutputPathForProcessingOptions(outputPath, item.media_ext, fallbackOptions);
+    job.run.summary_text = 'Retrying ' + item.id + ' with safer FFmpeg settings...';
+    await this._persistJob(job, false);
+    this._emitStatus(job);
+    await this._appendRunLog(
+      job,
+      '[' + item.id + '] Falling back to FFmpeg settings: audio=' + fallbackOptions.audioMode + ', framing=' + fallbackOptions.framingMode + '.'
+    );
+    await this._removeFileIfPresent(fallbackOutputPath);
+    try {
+      await this._processVideo(job, inputPath, fallbackOutputPath, fallbackOptions);
+      await this._removeFileIfPresent(inputPath);
+      await this._appendRunLog(
+        job,
+        '[' + item.id + '] Safer FFmpeg fallback succeeded.'
+      );
+      return {
+        itemOverrides: Object.assign(
+          { last_error: 'Requested processing failed twice. Saved with With Audiomark + Default Crop instead.' },
+          this._buildFilenameOverride(job, item, fallbackOutputPath)
+        ),
+      };
+    } catch (fallbackError) {
+      await this._removeFileIfPresent(fallbackOutputPath);
+      await this._appendRunLog(
+        job,
+        '[' + item.id + '] Safer FFmpeg fallback failed: ' + this._formatErrorMessage(fallbackError)
+      );
+      if (job.cancelRequested && String((fallbackError && fallbackError.message) || fallbackError || '') === 'download_cancelled') {
+        throw new BackupCancelledError();
+      }
+    }
+
+    const preservedSourcePath = this._buildOutputPathForProcessingOptions(outputPath, item.media_ext, {
+      audioMode: 'with_audiomark',
+      framingMode: 'sora_default',
+    });
+    await this._removeFileIfPresent(outputPath);
+    await this._removeFileIfPresent(preservedSourcePath);
+    await fs.promises.mkdir(path.dirname(preservedSourcePath), { recursive: true });
+    await fs.promises.rename(inputPath, preservedSourcePath);
+    await this._appendRunLog(
+      job,
+      '[' + item.id + '] Preserved the original downloaded file after FFmpeg failures.'
+    );
+    return {
+      itemOverrides: Object.assign(
+        { last_error: 'FFmpeg failed. Saved the original downloaded video instead.' },
+        this._buildFilenameOverride(job, item, preservedSourcePath)
+      ),
+    };
+  }
+
+  _buildVideoProcessingSummary(item, audioMode, framingMode) {
+    const steps = [];
+    if (normalizeBackupAudioMode(audioMode) === 'no_audiomark') {
+      steps.push('removing audiomark and stripping C2PA manifest data');
+    }
+    if (normalizeBackupFramingMode(framingMode) === 'social_16_9') steps.push('cropping for social');
+    if (!steps.length) return 'Processing ' + item.id + '...';
+    return 'Processing ' + item.id + ': ' + steps.join(' and ') + '...';
+  }
+
+  _buildFallbackVideoProcessingOptions(options) {
+    return {
+      audioMode: 'with_audiomark',
+      framingMode: 'sora_default',
+      width: options && options.width,
+      height: options && options.height,
+    };
+  }
+
+  _buildOutputPathForProcessingOptions(outputPath, mediaExt, options) {
+    const parsed = path.parse(outputPath);
+    const audioMode = normalizeBackupAudioMode(options && options.audioMode);
+    const framingMode = normalizeBackupFramingMode(options && options.framingMode);
+    let safeExt = sanitizeString(mediaExt, 16) || 'mp4';
+    if (audioMode === 'no_audiomark') safeExt = 'mov';
+    else if (framingMode === 'social_16_9') safeExt = 'mp4';
+    return path.join(parsed.dir, parsed.name + '.' + safeExt);
+  }
+
+  _buildFilenameOverride(job, item, absolutePath) {
+    const baseDownloadDir = job && job.run && job.run.download_dir
+      ? job.run.download_dir
+      : (this.state && this.state.settings && this.state.settings.downloadDir) || '';
+    const relativePath = baseDownloadDir ? path.relative(baseDownloadDir, absolutePath) : absolutePath;
+    if (!relativePath || relativePath === item.filename) return {};
+    return { filename: relativePath };
+  }
+
+  _formatErrorMessage(error) {
+    return sanitizeString(String((error && (error.userMessage || error.message)) || error || 'processing_failed'), 1024) || 'processing_failed';
+  }
+
+  async _appendRunLog(job, message) {
+    if (!job || !job.run || !job.run.id || !message) return;
+    await this.store.appendLog(job.run.id, message).catch(() => {});
+  }
+
+  async _applyWatermarkDownloadThrottle(job, publishedDownloadMode) {
+    if (publishedDownloadMode !== 'direct_sora') return;
+    const lastStartedAt = Number(job && job.lastWatermarkDownloadStartedAt) || 0;
+    const waitMs = Math.max(0, WATERMARK_DOWNLOAD_THROTTLE_MS - (Date.now() - lastStartedAt));
+    if (waitMs > 0) {
+      await this._waitForDelay(waitMs);
+    }
+    if (job) job.lastWatermarkDownloadStartedAt = Date.now();
+  }
+
+  async _waitForDelay(waitMs) {
+    if (!(waitMs > 0)) return;
+    const signal = this._createActiveAbortSignal();
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      let timeoutId = null;
+      const cleanup = () => {
+        if (timeoutId) clearTimeout(timeoutId);
+        signal.removeEventListener('abort', onAbort);
+        if (this.activeAbortController && this.activeAbortController.signal === signal) {
+          this.activeAbortController = null;
+        }
+      };
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        reject(new Error('download_cancelled'));
+      };
+      timeoutId = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve();
+      }, waitMs);
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
     });
   }
 
@@ -561,6 +815,145 @@ class BackupService extends EventEmitter {
     if (this.session && this.session.abortActiveRequest) {
       this.session.abortActiveRequest();
     }
+  }
+
+  _createSmartDownloadState(publishedDownloadMode) {
+    if (publishedDownloadMode !== 'smart') return null;
+    const providers = getSmartDownloadProviders();
+    if (!providers.length) return null;
+    return {
+      providers: providers,
+      activeProviderIndex: providers.length === 1 ? 0 : randomInt(providers.length),
+      consecutiveFailures: 0,
+      deferredItems: [],
+      deferredItemKeys: new Set(),
+      itemRetryCounts: new Map(),
+      maxRetriesPerItem: Math.max(2, providers.length * 2),
+      flushDeferredNow: false,
+    };
+  }
+
+  _getSmartDownloadState(job) {
+    return job && job.smartDownload && Array.isArray(job.smartDownload.providers) && job.smartDownload.providers.length
+      ? job.smartDownload
+      : null;
+  }
+
+  _takeNextQueuedItem(job, nextIndex) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (smartDownload && smartDownload.flushDeferredNow && smartDownload.deferredItems.length) {
+      const deferred = smartDownload.deferredItems.shift();
+      smartDownload.deferredItemKeys.delete(deferred.item_key);
+      if (!smartDownload.deferredItems.length) smartDownload.flushDeferredNow = false;
+      return {
+        item: deferred,
+        nextIndex: nextIndex,
+      };
+    }
+
+    if (nextIndex < job.items.length) {
+      return {
+        item: job.items[nextIndex],
+        nextIndex: nextIndex + 1,
+      };
+    }
+
+    if (smartDownload && smartDownload.deferredItems.length) {
+      smartDownload.flushDeferredNow = true;
+      return this._takeNextQueuedItem(job, nextIndex);
+    }
+
+    return null;
+  }
+
+  _createSmartProviderError(providerId, stage, error) {
+    const message = sanitizeString(String((error && error.message) || error || 'smart_download_failed'), 1024) || 'smart_download_failed';
+    const wrapped = new Error(message);
+    wrapped.smartProviderFailure = true;
+    wrapped.smartProviderId = sanitizeString(providerId, 64) || '';
+    wrapped.smartProviderStage = sanitizeString(stage, 32) || '';
+    wrapped.cause = error;
+    return wrapped;
+  }
+
+  _isSmartProviderDownloadError(error, downloadRequest) {
+    if (!downloadRequest || !downloadRequest.providerId) return false;
+    const message = String((error && error.message) || error || '').trim();
+    if (!message || message === 'download_cancelled') return false;
+    return (
+      /^download_http_/i.test(message) ||
+      /^download_timeout$/i.test(message) ||
+      /^smart_download_/i.test(message) ||
+      /ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|aborted/i.test(message)
+    );
+  }
+
+  _queueDeferredSmartDownloadItem(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return;
+    if (smartDownload.deferredItemKeys.has(item.item_key)) return;
+    smartDownload.deferredItemKeys.add(item.item_key);
+    smartDownload.deferredItems.push(item);
+  }
+
+  _clearSmartDownloadRetryState(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return;
+    smartDownload.itemRetryCounts.delete(item.item_key);
+  }
+
+  _resetSmartDownloadFailures(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload) return;
+    smartDownload.consecutiveFailures = 0;
+    this._clearSmartDownloadRetryState(job, item);
+    if (smartDownload.deferredItems.length) {
+      smartDownload.flushDeferredNow = true;
+    }
+  }
+
+  _switchSmartDownloadProvider(job) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || smartDownload.providers.length < 2) return false;
+    smartDownload.activeProviderIndex = (smartDownload.activeProviderIndex + 1) % smartDownload.providers.length;
+    smartDownload.consecutiveFailures = 0;
+    smartDownload.flushDeferredNow = true;
+    return true;
+  }
+
+  _handleSmartDownloadFailure(job, item, error, downloadRequest, publishedDownloadMode) {
+    if (publishedDownloadMode !== 'smart' || !item || item.kind !== 'published' || item.media_variant === 'no_watermark') {
+      return false;
+    }
+
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload) return false;
+
+    const isProviderFailure =
+      !!(error && error.smartProviderFailure) ||
+      this._isSmartProviderDownloadError(error, downloadRequest);
+    if (!isProviderFailure) return false;
+
+    const retryCount = (smartDownload.itemRetryCounts.get(item.item_key) || 0) + 1;
+    smartDownload.itemRetryCounts.set(item.item_key, retryCount);
+    smartDownload.consecutiveFailures += 1;
+    const shouldRetryItem = retryCount < smartDownload.maxRetriesPerItem;
+    const switchedProvider = smartDownload.consecutiveFailures >= 2 && this._switchSmartDownloadProvider(job);
+    if (!shouldRetryItem) {
+      this._clearSmartDownloadRetryState(job, item);
+      error.userMessage = SMART_DOWNLOAD_OVERLOADED_MESSAGE;
+      job.run.summary_text = SMART_DOWNLOAD_OVERLOADED_MESSAGE;
+      return false;
+    }
+
+    const lastError = sanitizeString(String((error && error.message) || error || 'smart_download_failed'), 1024) || 'smart_download_failed';
+    this._transitionItem(job, item, 'queued', { last_error: lastError });
+    this._queueDeferredSmartDownloadItem(job, item);
+
+    if (switchedProvider) {
+      job.run.summary_text = 'Retrying failed downloads with backup no-watermark provider…';
+    }
+    return true;
   }
 
   _transitionItem(job, item, nextStatus, overrides) {

@@ -22,7 +22,7 @@ async function readJson(filePath, fallbackValue) {
 
 async function writeJson(filePath, value) {
   await ensureDir(path.dirname(filePath));
-  const tempPath = filePath + '.tmp';
+  const tempPath = filePath + '.' + process.pid + '.' + Date.now() + '.' + Math.random().toString(16).slice(2) + '.tmp';
   await fs.promises.writeFile(tempPath, JSON.stringify(value, null, 2));
   await fs.promises.rename(tempPath, filePath);
 }
@@ -33,6 +33,23 @@ class FileStore {
     this.statePath = path.join(baseDir, 'state.json');
     this.runsDir = path.join(baseDir, 'runs');
     this.logsDir = path.join(baseDir, 'logs');
+    this.pendingWrites = new Map();
+  }
+
+  _queueWrite(filePath, writer) {
+    const previous = this.pendingWrites.get(filePath) || Promise.resolve();
+    const next = previous.catch(() => {}).then(() => writer());
+    const tracked = next.finally(() => {
+      if (this.pendingWrites.get(filePath) === tracked) {
+        this.pendingWrites.delete(filePath);
+      }
+    });
+    this.pendingWrites.set(filePath, tracked);
+    return tracked;
+  }
+
+  async _writeJson(filePath, value) {
+    await this._queueWrite(filePath, () => writeJson(filePath, value));
   }
 
   async initialize() {
@@ -64,7 +81,7 @@ class FileStore {
   }
 
   async saveState(nextState) {
-    await writeJson(this.statePath, nextState);
+    await this._writeJson(this.statePath, nextState);
     return nextState;
   }
 
@@ -85,7 +102,7 @@ class FileStore {
   async saveRun(run) {
     const runDir = this.getRunDir(run.id);
     await ensureDir(runDir);
-    await writeJson(path.join(runDir, 'run.json'), summarizeBackupRun(run));
+    await this._writeJson(path.join(runDir, 'run.json'), summarizeBackupRun(run));
     return run;
   }
 
@@ -98,7 +115,7 @@ class FileStore {
     if (!runId) return;
     const runDir = this.getRunDir(runId);
     await ensureDir(runDir);
-    await writeJson(path.join(runDir, 'items.json'), Array.isArray(items) ? items : []);
+    await this._writeJson(path.join(runDir, 'items.json'), Array.isArray(items) ? items : []);
   }
 
   async getItems(runId) {
@@ -124,7 +141,7 @@ class FileStore {
         run: summarizeBackupRun(run),
         items_total: Array.isArray(items) ? items.length : 0,
       };
-      await writeJson(summaryPath, payload);
+      await this._writeJson(summaryPath, payload);
       return { path: summaryPath, filename: path.basename(summaryPath) };
     }
     const targetItems = targetFormat === 'failures'

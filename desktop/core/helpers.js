@@ -185,6 +185,10 @@ function normalizeBackupAudioMode(value) {
   return value === 'no_audiomark' ? 'no_audiomark' : 'with_audiomark';
 }
 
+function normalizeBackupFramingMode(value) {
+  return value === 'social_16_9' ? 'social_16_9' : 'sora_default';
+}
+
 function normalizeCharacterHandle(value) {
   const raw = sanitizeString(value, 80) || '';
   if (!raw) return '';
@@ -196,6 +200,7 @@ function normalizeBackupRequestSettings(value) {
   return {
     published_download_mode: normalizeBackupPublishedMode(raw.published_download_mode),
     audio_mode: normalizeBackupAudioMode(raw.audio_mode),
+    framing_mode: normalizeBackupFramingMode(raw.framing_mode),
     character_handle: normalizeCharacterHandle(raw.character_handle),
   };
 }
@@ -457,6 +462,7 @@ function buildBackupFolderName(run, bucket) {
   const settings = normalizeBackupRequestSettings(run && run.settings);
   const watermarkLabel = settings.published_download_mode === 'direct_sora' ? 'With Watermark' : 'No Watermark';
   const audiomarkLabel = settings.audio_mode === 'with_audiomark' ? 'Yes Audiomark' : 'No Audiomark';
+  const framingLabel = settings.framing_mode === 'social_16_9' ? '16:9 for Social' : 'Default Crop';
   let folderPrefix = bucket;
   if (bucket === 'ownPosts') folderPrefix = 'My Sora Posts';
   else if (bucket === 'ownDrafts') folderPrefix = 'My Sora Drafts';
@@ -466,13 +472,14 @@ function buildBackupFolderName(run, bucket) {
     const handle = normalizeCharacterHandle(settings.character_handle);
     folderPrefix = handle ? ('@' + handle + ' Sora Posts') : 'Character Sora Posts';
   }
-  return folderPrefix + ' - ' + watermarkLabel + ', ' + audiomarkLabel;
+  return folderPrefix + ' - ' + watermarkLabel + ', ' + audiomarkLabel + ', ' + framingLabel;
 }
 
 function buildBackupFilename(run, bucket, id, ext) {
-  const safeExt = normalizeBackupAudioMode(run && run.settings && run.settings.audio_mode) === 'no_audiomark'
-    ? 'mov'
-    : (sanitizeString(ext, 16) || 'mp4');
+  const settings = normalizeBackupRequestSettings(run && run.settings);
+  let safeExt = sanitizeString(ext, 16) || 'mp4';
+  if (settings.audio_mode === 'no_audiomark') safeExt = 'mov';
+  else if (settings.framing_mode === 'social_16_9') safeExt = 'mp4';
   const folderName = buildBackupFolderName(run, bucket);
   return path.join(BACKUP_DOWNLOAD_FOLDER, folderName, id + '.' + safeExt);
 }
@@ -736,6 +743,7 @@ module.exports = {
   buildBackupHistoricalBucketCounts,
   normalizeBackupRequestSettings,
   normalizeBackupAudioMode,
+  normalizeBackupFramingMode,
   normalizeCharacterHandle,
   getBackupFeedLimitForSettings,
   getBackupDraftLimitForSettings,

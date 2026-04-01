@@ -13,7 +13,7 @@ It can download:
 
 Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), and [alexandria](https://github.com/alexdredmon).
 
-Watermark removal powered by [monson](https://www.paypal.com/paypalme/afiqhamdan/) — please consider donating to them as a thank you for creating the key piece to this puzzle.
+Watermark removal powered by [monson](https://kontenai.net?ref=topher) and [soravdl](https://soravdl.com).
 
 ## Using The App
 
@@ -54,15 +54,20 @@ After the app opens, use it the same way as the packaged app flow above.
 `Audio Mode`
 
 - `With Audiomark` saves the downloaded video as-is
-- `No Audiomark` removes the audiomark and writes the final file as `.mov`
+- `No Audiomark` removes the audiomark, strips C2PA manifest data, and writes the final file as `.mov`
+
+`Crop`
+
+- `Default Crop` preserves the source framing
+- `16:9 for Social` center-crops landscape videos to 16:9, portrait videos to 9:16, and re-encodes the video for export
 
 ## Download Folders
 
 Downloads are saved inside a main folder called `Sora Video Downloader`.
 
 Inside that, the app creates folders based on the mode and your selected output settings, for example:
-- `My Sora Posts - No Watermark, No Audiomark`
-- `My Sora Drafts - No Watermark, Yes Audiomark`
+- `My Sora Posts - No Watermark, No Audiomark, Default Crop`
+- `My Sora Drafts - No Watermark, Yes Audiomark, 16:9 for Social`
 - `@ringcamera Sora Posts - No Watermark, Yes Audiomark`
 
 ## Building Packaged Apps

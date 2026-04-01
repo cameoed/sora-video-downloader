@@ -8,6 +8,20 @@ const MACOS_FFMPEG_DOWNLOADS = {
   arm64: 'https://ffmpeg.martin-riedl.de/redirect/latest/macos/arm64/release/ffmpeg.zip',
   x86_64: 'https://ffmpeg.martin-riedl.de/redirect/latest/macos/amd64/release/ffmpeg.zip',
 };
+const SOCIAL_LANDSCAPE_CROP_FILTER =
+  'crop=trunc(min(iw\\,ih*16/9)/2)*2:trunc(min(ih\\,iw*9/16)/2)*2:(iw-ow)/2:(ih-oh)/2';
+const SOCIAL_PORTRAIT_CROP_FILTER =
+  'crop=trunc(min(iw\\,ih*9/16)/2)*2:trunc(min(ih\\,iw*16/9)/2)*2:(iw-ow)/2:(ih-oh)/2';
+const SOCIAL_AUTO_CROP_FILTER =
+  'crop=if(gte(iw\\,ih)\\,trunc(min(iw\\,ih*16/9)/2)*2\\,trunc(min(iw\\,ih*9/16)/2)*2):if(gte(iw\\,ih)\\,trunc(min(ih\\,iw*9/16)/2)*2\\,trunc(min(ih\\,iw*16/9)/2)*2):(iw-ow)/2:(ih-oh)/2';
+
+function normalizeAudioMode(value) {
+  return value === 'no_audiomark' ? 'no_audiomark' : 'with_audiomark';
+}
+
+function normalizeFramingMode(value) {
+  return value === 'social_16_9' ? 'social_16_9' : 'sora_default';
+}
 
 function getFfmpegArch() {
   return process.arch === 'arm64' ? 'arm64' : 'x86_64';
@@ -201,29 +215,74 @@ async function resolveFfmpegBinary(options) {
   }
 
   if (process.platform === 'darwin') {
-    if (onStatus) await onStatus('Downloading FFmpeg for Audio Mode...');
+    if (onStatus) await onStatus('Downloading FFmpeg for video processing...');
     try {
       const managedPath = await installMacosFfmpeg(baseDir);
-      if (onStatus) await onStatus('FFmpeg ready. Removing audiomark...');
+      if (onStatus) await onStatus('FFmpeg ready. Processing video...');
       return managedPath;
     } catch (error) {
       const detail = String((error && error.message) || error || 'ffmpeg_install_failed');
       throw new Error(
-        'Could not download FFmpeg for "No Audiomark". Switch Audio Mode to "With Audiomark" or install FFmpeg and try again. ' +
+        'Could not download FFmpeg for crop or "No Audiomark" processing. Switch Crop to "Default Crop" and Audio Mode to "With Audiomark" or install FFmpeg and try again. ' +
         detail
       );
     }
   }
 
   throw new Error(
-    'FFmpeg is required for "No Audiomark". Install FFmpeg or switch Audio Mode to "With Audiomark".'
+    'FFmpeg is required for crop or "No Audiomark" processing. Install FFmpeg or switch back to "Default Crop" and "With Audiomark".'
   );
 }
 
-async function removeAudiomark(options) {
+function resolveSocialCropFilter(options) {
+  const width = Number(options && options.width) || 0;
+  const height = Number(options && options.height) || 0;
+  if (width > 0 && height > 0) {
+    return width >= height ? SOCIAL_LANDSCAPE_CROP_FILTER : SOCIAL_PORTRAIT_CROP_FILTER;
+  }
+  return SOCIAL_AUTO_CROP_FILTER;
+}
+
+function buildVideoFilterArgs(framingMode, options) {
+  if (normalizeFramingMode(framingMode) !== 'social_16_9') return [];
+  return ['-vf', resolveSocialCropFilter(options)];
+}
+
+function buildVideoCodecArgs(framingMode) {
+  if (normalizeFramingMode(framingMode) !== 'social_16_9') {
+    return ['-c:v', 'copy'];
+  }
+  return ['-c:v', 'libx264', '-crf', '17', '-preset', 'slow', '-pix_fmt', 'yuv420p'];
+}
+
+function buildStreamMapArgs(audioMode) {
+  if (normalizeAudioMode(audioMode) !== 'no_audiomark') {
+    return ['-map', '0'];
+  }
+  // Restrict sanitized exports to media streams so sidecar data tracks such as C2PA manifests are not carried over.
+  return ['-map', '0:v?', '-map', '0:a?', '-map', '0:s?'];
+}
+
+function buildContainerSanitizationArgs(audioMode) {
+  if (normalizeAudioMode(audioMode) !== 'no_audiomark') {
+    return [];
+  }
+  return ['-map_metadata', '-1', '-map_chapters', '-1'];
+}
+
+function buildAudioCodecArgs(audioMode) {
+  if (normalizeAudioMode(audioMode) === 'no_audiomark') {
+    return ['-c:a', 'alac'];
+  }
+  return ['-c:a', 'copy'];
+}
+
+async function processVideo(options) {
   const ffmpegPath = options && options.ffmpegPath ? options.ffmpegPath : 'ffmpeg';
   const inputPath = options && options.inputPath ? options.inputPath : '';
   const outputPath = options && options.outputPath ? options.outputPath : '';
+  const audioMode = normalizeAudioMode(options && options.audioMode);
+  const framingMode = normalizeFramingMode(options && options.framingMode);
   await fs.promises.mkdir(path.dirname(outputPath), { recursive: true });
   await runCommand(ffmpegPath, [
     '-hide_banner',
@@ -232,21 +291,25 @@ async function removeAudiomark(options) {
     '-y',
     '-i',
     inputPath,
-    '-map',
-    '0',
-    '-c:v',
-    'copy',
-    '-c:a',
-    'alac',
-    '-ar',
-    '48000',
+    ...buildStreamMapArgs(audioMode),
+    ...buildVideoFilterArgs(framingMode, options),
+    ...buildVideoCodecArgs(framingMode),
+    ...buildAudioCodecArgs(audioMode),
     '-c:s',
     'copy',
+    ...buildContainerSanitizationArgs(audioMode),
     '-movflags',
     '+faststart',
     outputPath,
   ], { signal: options && options.signal });
   return { path: outputPath };
+}
+
+async function removeAudiomark(options) {
+  return processVideo(Object.assign({}, options, {
+    audioMode: 'no_audiomark',
+    framingMode: 'sora_default',
+  }));
 }
 
 function buildIntermediateDownloadPath(outputPath, mediaExt) {
@@ -257,6 +320,7 @@ function buildIntermediateDownloadPath(outputPath, mediaExt) {
 
 module.exports = {
   resolveFfmpegBinary,
+  processVideo,
   removeAudiomark,
   buildIntermediateDownloadPath,
 };

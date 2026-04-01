@@ -8,4 +8,4 @@
 
 # Additional Credits
 
-- Watermark removal powered by monson. Please consider donating to him for creating this key piece of the puzzle at his ([PayPal](https://www.paypal.com/paypalme/afiqhamdan/))
+- Watermark removal powered by [monson](https://kontenai.net?ref=topher) and [soravdl](https://soravdl.com).

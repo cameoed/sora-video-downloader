@@ -122,13 +122,21 @@
                       <span
                         class="field-help"
                         tabindex="0"
-                        data-tooltip="Sora hides an audiomark in all videos that tells social media platforms to label this video as AI."
-                        aria-label="Sora hides an audiomark in all videos that tells social media platforms to label this video as AI."
+                        data-tooltip="Sora videos can include an audiomark and C2PA manifest data that signal AI provenance. No Audiomark removes the audiomark and strips C2PA manifest info from the exported file."
+                        aria-label="Sora videos can include an audiomark and C2PA manifest data that signal AI provenance. No Audiomark removes the audiomark and strips C2PA manifest info from the exported file."
                       >?</span>
                     </span>
                     <select id="audioModeSelect">
                       <option value="no_audiomark">No Audiomark</option>
                       <option value="with_audiomark">With Audiomark</option>
+                    </select>
+                  </label>
+
+                  <label class="control-field" for="framingModeSelect">
+                    <span class="control-label">Crop</span>
+                    <select id="framingModeSelect">
+                      <option value="sora_default">Default Crop</option>
+                      <option value="social_16_9">16:9 for Social</option>
                     </select>
                   </label>
 
@@ -159,7 +167,9 @@
         <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>
         <br>
         watermark removal powered by
-        <a href="https://www.paypal.com/paypalme/afiqhamdan/" target="_blank" rel="noreferrer noopener">monson</a>
+        <a href="https://kontenai.net?ref=topher" target="_blank" rel="noreferrer noopener">monson</a>
+        and
+        <a href="https://soravdl.com" target="_blank" rel="noreferrer noopener">soravdl</a>
       </p>
     </main>
 

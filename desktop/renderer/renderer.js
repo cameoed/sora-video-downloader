@@ -1,11 +1,13 @@
 (function initializeRenderer() {
   const appApi = window.soraBackupApp;
   const SCOPE_KEYS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts', 'characterPosts'];
+  const SMART_DOWNLOAD_OVERLOADED_MESSAGE = 'All watermark removers are overloaded right now. Please try again later.';
   const state = {
     settings: {
       downloadDir: '',
       published_download_mode: 'smart',
       audio_mode: 'with_audiomark',
+      framing_mode: 'sora_default',
       selectedScope: 'ownPosts',
       character_handle: '',
     },
@@ -30,6 +32,7 @@
     chooseDirBtn: document.getElementById('chooseDirBtn'),
     modeSelect: document.getElementById('modeSelect'),
     audioModeSelect: document.getElementById('audioModeSelect'),
+    framingModeSelect: document.getElementById('framingModeSelect'),
     characterHandle: document.getElementById('characterHandle'),
     characterScopeName: document.getElementById('characterScopeName'),
     startBackupBtn: document.getElementById('startBackupBtn'),
@@ -197,6 +200,9 @@
     const metrics = getProgressMetrics();
     const authenticated = !!(state.session && state.session.authenticated);
     const runActive = !!(run && (run.status === 'discovering' || run.status === 'running'));
+    const overloadNotice = run && run.last_error === SMART_DOWNLOAD_OVERLOADED_MESSAGE
+      ? SMART_DOWNLOAD_OVERLOADED_MESSAGE
+      : '';
     if (!run) {
       setText(
         ui.heroSubtitle,
@@ -213,7 +219,7 @@
     }
 
     if (!runActive && !state.authPollInFlight && !authenticated) {
-      setText(ui.heroSubtitle, state.headerNotice || state.sessionPrompt || 'Sign in to get started');
+      setText(ui.heroSubtitle, state.headerNotice || overloadNotice || state.sessionPrompt || 'Sign in to get started');
       setText(ui.progressBadge, '0% complete');
       ui.progressFill.style.width = '0%';
       ui.openRunFolderBtn.hidden = !run.id;
@@ -229,7 +235,7 @@
       : '';
     setText(
       ui.heroSubtitle,
-      state.headerNotice || noResultsLabel || (run.status === 'cancelled' ? stoppedLabel : (actionLabel + ' · ' + completeLabel + ' of ' + totalLabel))
+      state.headerNotice || overloadNotice || noResultsLabel || (run.status === 'cancelled' ? stoppedLabel : (actionLabel + ' · ' + completeLabel + ' of ' + totalLabel))
     );
     setText(ui.progressBadge, metrics.percent + '% complete');
     ui.progressFill.style.width = metrics.percent + '%';
@@ -272,6 +278,7 @@
     ui.downloadDir.value = state.settings.downloadDir || '';
     ui.modeSelect.value = state.settings.published_download_mode || 'smart';
     ui.audioModeSelect.value = state.settings.audio_mode || 'with_audiomark';
+    ui.framingModeSelect.value = state.settings.framing_mode || 'sora_default';
     ui.characterHandle.value = state.settings.character_handle || '';
     setSelectedScope(state.settings.selectedScope || 'ownPosts');
     renderScopeProgress();
@@ -417,6 +424,7 @@
     const settingsPatch = {
       published_download_mode: ui.modeSelect.value,
       audio_mode: ui.audioModeSelect.value,
+      framing_mode: ui.framingModeSelect.value,
       selectedScope: selectedScope,
       character_handle: characterHandle,
     };
@@ -428,6 +436,7 @@
       settings: {
         published_download_mode: state.settings.published_download_mode,
         audio_mode: state.settings.audio_mode,
+        framing_mode: state.settings.framing_mode,
         character_handle: state.settings.character_handle,
       },
       downloadDir: state.settings.downloadDir,
@@ -491,6 +500,9 @@
   });
   ui.audioModeSelect.addEventListener('change', () => {
     persistSettings({ audio_mode: ui.audioModeSelect.value }).catch(() => {});
+  });
+  ui.framingModeSelect.addEventListener('change', () => {
+    persistSettings({ framing_mode: ui.framingModeSelect.value }).catch(() => {});
   });
   ui.characterHandle.addEventListener('input', () => {
     state.settings.character_handle = ui.characterHandle.value.trim();
