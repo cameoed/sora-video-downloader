@@ -3,6 +3,12 @@ dist/
 release/
 tests/
 *.log
+.DS_Store
+.codex-tmp/
+.tmp_*.js
+tmp_*.js
+*.pyc
+desktop/scripts/__pycache__/
 desktop/vendor/
 desktop/build-resources/icon.ico
 desktop/build-resources/icon.icns

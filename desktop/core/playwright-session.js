@@ -820,7 +820,7 @@ class PlaywrightSession {
     if (!normalizedHandle) throw new Error('backup_character_missing_handle');
     const characterId = await this.resolveCharacterUserId(normalizedHandle, options);
     const response = await this.fetchJson(
-      '/backend/project_y/profile/' + encodeURIComponent(characterId) + '/drafts/cameos',
+      '/backend/project_y/profile/drafts/cameos/character/' + encodeURIComponent(characterId),
       params,
       Object.assign({}, options, { maxAttempts: 1, throwOnError: false })
     );

@@ -80,19 +80,22 @@ class FileStore {
         ownPrompts: 0,
       },
       savedCatalog: {
-        ownDrafts: [],
-        ownPosts: [],
-        castInPosts: [],
-        castInDrafts: [],
+        ownDrafts: {},
+        ownPosts: {},
+        castInPosts: {},
+        castInDrafts: {},
         characterPosts: {},
         ownPrompts: [],
+        characterDrafts: {},
       },
+      savedCatalogVersion: 2,
       completeScanCatalog: {
         ownPosts: null,
         ownDrafts: null,
         castInPosts: null,
         castInDrafts: null,
         characterPosts: {},
+        characterDrafts: {},
       },
       draftPublishUsage: {
         date: '',
@@ -108,6 +111,7 @@ class FileStore {
         castInDrafts: null,
         ownPrompts: null,
         characterPosts: {},
+        characterDrafts: {},
       },
     });
   }

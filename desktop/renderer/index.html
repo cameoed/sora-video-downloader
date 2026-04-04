@@ -18,13 +18,14 @@
             </div>
             <div class="session-actions">
               <button id="openLoginBtn" type="button" class="session-pill" data-tone="warn">Open Sora</button>
-              <button id="manualBearerBtn" type="button" class="session-icon-button" data-tone="warn" aria-label="Connect with bearer token">🔒</button>
+              <button id="manualBearerBtn" type="button" class="session-icon-button" data-tone="warn" aria-label="Connect with bearer token"><span class="session-icon-glyph session-icon-glyph--lock" aria-hidden="true">🔒</span></button>
+              <button id="musicToggleBtn" type="button" class="session-icon-button" data-tone="idle" aria-label="Play music on loop" aria-pressed="false"><span class="session-icon-glyph session-icon-glyph--music" aria-hidden="true">🎵</span></button>
             </div>
           </div>
 
           <div class="panel-progress-meta">
             <span id="progressBadge" class="panel-progress-badge">0% complete</span>
-            <button id="openRunFolderBtn" type="button" class="panel-link-button">Open folder</button>
+            <button id="openRunFolderBtn" type="button" class="panel-link-button">Open downloads</button>
             <button id="clearCacheBtn" type="button" class="panel-link-button">Clear cache</button>
           </div>
 
@@ -42,10 +43,12 @@
               <div class="section-strip">
                 <div class="section-header section-header--tight">
                   <p class="section-label">Backup</p>
-                  <p class="section-note">Set your preferences, then start backup!</p>
+                  <p class="section-note">Pick your source, then start backup!</p>
                 </div>
                 <div class="backup-actions backup-actions--inline">
-                  <button id="startBackupBtn" type="button">Start backup</button>
+                  <span id="startBackupTooltip" class="button-tooltip-anchor">
+                    <button id="startBackupBtn" type="button">Start backup</button>
+                  </span>
                   <button id="cancelBackupBtn" type="button">Stop</button>
                 </div>
               </div>
@@ -141,7 +144,7 @@
             <div class="settings-card">
               <div class="section-header section-header--tight">
                 <p class="section-label">Settings</p>
-                <p class="section-note">Tune download behavior and choose where your backups land.</p>
+                <p class="section-note">Set your preferences and choose where your backups land.</p>
               </div>
 
               <div class="settings-body settings-body--flat">
@@ -174,7 +177,7 @@
                     <span class="control-label">Crop</span>
                     <select id="framingModeSelect">
                       <option value="sora_default">Default Crop</option>
-                      <option value="social_16_9">16:9 for Social</option>
+                      <option value="social_16_9">Cropped for Social Media</option>
                     </select>
                   </label>
 
@@ -229,19 +232,43 @@
       </section>
 
       <p class="panel-credit">
-        built by
-        <a href="http://discord.gg/topher" target="_blank" rel="noreferrer noopener">topher</a>
-        with huge contributions by
-        <a href="https://github.com/lgcarrier" target="_blank" rel="noreferrer noopener">lgcarrier</a>,
-        <a href="https://github.com/byeson" target="_blank" rel="noreferrer noopener">byeson</a>,
-        <a href="https://github.com/slogonomo" target="_blank" rel="noreferrer noopener">slogonomo</a>,
-        <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>,
-        <a href="https://github.com/nikaskeba/" target="_blank" rel="noreferrer noopener">udio</a>
-        <br>
-        watermark removal powered by
-        <a href="https://kontenai.net?ref=topher" target="_blank" rel="noreferrer noopener">monson</a>
-        and
-        <a href="https://soravdl.com" target="_blank" rel="noreferrer noopener">soravdl</a>
+        <span class="panel-credit-line">
+          <span class="panel-credit-headline">
+            <a class="panel-credit-avatar-link" href="http://discord.gg/topher" target="_blank" rel="noreferrer noopener" aria-label="Topher Discord">
+              <img class="panel-credit-avatar" src="../../icons/topher.webp" alt="Topher avatar" />
+            </a>
+            <span class="panel-credit-copy">
+              built by
+              <a href="http://discord.gg/topher" target="_blank" rel="noreferrer noopener">topher</a>
+            </span>
+          </span>
+          <span class="panel-credit-divider" aria-hidden="true">·</span>
+          <span class="panel-credit-copy">
+            huge contributions by
+            <a href="https://github.com/lgcarrier" target="_blank" rel="noreferrer noopener">lgcarrier</a>,
+            <a href="https://github.com/byeson" target="_blank" rel="noreferrer noopener">byeson</a>,
+            <a href="https://github.com/slogonomo" target="_blank" rel="noreferrer noopener">slogonomo</a>,
+            <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>,
+            <a href="https://github.com/nikaskeba/" target="_blank" rel="noreferrer noopener">udio</a>
+          </span>
+        </span>
+        <span class="panel-credit-line">
+          <span class="panel-credit-copy">
+            open source on
+            <a href="https://github.com/cameoed/sora-video-downloader" target="_blank" rel="noreferrer noopener">Github</a>
+          </span>
+          <span class="panel-credit-divider" aria-hidden="true">·</span>
+          <span class="panel-credit-copy">
+            watermark removal powered by
+            <a href="https://kontenai.net?ref=topher" target="_blank" rel="noreferrer noopener">monson</a>
+            and
+            <a href="https://soravdl.com" target="_blank" rel="noreferrer noopener">soravdl</a>
+          </span>
+          <span class="panel-credit-divider" aria-hidden="true">·</span>
+          <span class="panel-credit-copy">
+            <a href="https://www.youtube.com/watch?v=cmdprbBOMT8" target="_blank" rel="noreferrer noopener">theme song</a>
+          </span>
+        </span>
       </p>
 
       <div id="clearCacheModal" class="cache-modal" hidden>
@@ -259,6 +286,10 @@
             <p id="clearCacheLoading" class="cache-modal-status">Loading cache targets…</p>
 
             <div id="clearCacheContent">
+              <div class="cache-modal-toolbar">
+                <button id="clearCacheToggleBtn" type="button" class="panel-link-button">Select all</button>
+              </div>
+
               <div class="cache-option-section">
                 <p class="cache-option-heading">Modes</p>
                 <div id="clearCacheModesList" class="cache-option-list"></div>
@@ -310,7 +341,7 @@
           <div class="cache-modal-head">
             <div class="section-header section-header--tight">
               <p class="section-label">Draft Backup</p>
-              <h2 id="draftCookieTitle" class="cache-modal-title">Cookie + bearer needed!</h2>
+              <h2 id="draftCookieTitle" class="cache-modal-title">For Drafts, you need to provide more info!</h2>
             </div>
           </div>
 

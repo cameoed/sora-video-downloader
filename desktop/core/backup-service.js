@@ -59,14 +59,16 @@ const SCAN_PROGRESS_STALL_TIMEOUT_MS = 60 * 1000;
 const SCAN_PROGRESS_STALL_MAX_ATTEMPTS = 3;
 const SCAN_PROGRESS_STALL_RETRY_DELAY_MS = 2000;
 const DRAFT_LINK_PUBLISH_DAILY_LIMIT = 500;
-const DRAFT_LINK_PUBLISH_THROTTLE_MS = 4000;
-const DRAFT_LINK_PUBLISH_SETTLE_MS = 2000;
+const DRAFT_LINK_PUBLISH_THROTTLE_MS = 2000;
+const DRAFT_LINK_PUBLISH_SETTLE_MS = 1000;
 const DRAFT_LINK_PUBLISH_MAX_ATTEMPTS = 3;
 const MAX_DRAFT_LINK_POST_TEXT = 1999;
+const OWN_DRAFTS_DOWNLOAD_CONCURRENCY = 2;
 const SCAN_RESUME_BUCKET_KEYS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts', 'ownPrompts', 'characterPosts', 'characterDrafts'];
 const PROMPT_SIMILARITY_THRESHOLD = 0.95;
 const DEFAULT_ACCOUNT_STATE_KEY = '__default__';
 const DRAFT_SHARED_LINK_CATALOG_VERSION = 1;
+const SAVED_CATALOG_VERSION = 2;
 
 function formatLocalDateKey(value) {
   const date = value instanceof Date ? value : new Date(value || Date.now());
@@ -222,18 +224,6 @@ function normalizeManualCookieHeader(value) {
   return raw.replace(/^Cookie\s*:\s*/i, '').trim() || '';
 }
 
-function logAuthState(label, { cookieHeader, bearerToken } = {}) {
-  const cookieSummary = summarizeCookieHeader(cookieHeader || '');
-  console.log('[draft-auth]', label, JSON.stringify({
-    cookie_present: !!cookieHeader,
-    cookie_length: (cookieHeader || '').length,
-    cookie_count: cookieSummary.count,
-    cookie_names: cookieSummary.names,
-    bearer_present: !!(bearerToken),
-    bearer_length: (bearerToken || '').length,
-  }));
-}
-
 function summarizeCookieHeader(value) {
   const raw = sanitizeString(value, 65535) || '';
   if (!raw) return { present: false, count: 0, names: [] };
@@ -261,8 +251,7 @@ function hasReadyDraftSharedLink(item) {
 function backupRequiresManualDraftCookie(scopes, settings) {
   const normalizedScopes = normalizeBackupScopes(scopes || DEFAULT_BACKUP_SCOPES);
   const normalizedSettings = normalizeBackupRequestSettings(settings || {});
-  const isDraftScope = normalizedScopes.ownDrafts === true || normalizedScopes.castInDrafts === true || normalizedScopes.characterDrafts === true;
-  return isDraftScope && normalizedSettings.published_download_mode === 'smart';
+  return normalizedScopes.ownDrafts === true && normalizedSettings.published_download_mode === 'smart';
 }
 
 function hasRequiredManualDraftAuth(settings) {
@@ -309,17 +298,210 @@ function sameNormalizedBearerToken(left, right) {
   return normalizeManualBearerToken(left) === normalizeManualBearerToken(right);
 }
 
+function isCatalogObject(raw) {
+  return !!raw && typeof raw === 'object' && !Array.isArray(raw);
+}
+
+function buildSavedCatalogVariantKey(settings) {
+  const normalized = normalizeBackupRequestSettings(settings);
+  return [
+    normalized.published_download_mode,
+    normalized.audio_mode,
+    normalized.framing_mode,
+  ].join('__');
+}
+
+function normalizeSavedCatalogVariantKey(value) {
+  const raw = sanitizeString(value, 128) || '';
+  if (!raw) return '';
+  const parts = raw.split('__');
+  if (parts.length !== 3) return '';
+  if (parts[0] !== 'smart' && parts[0] !== 'direct_sora') return '';
+  if (parts[1] !== 'no_audiomark' && parts[1] !== 'with_audiomark') return '';
+  if (parts[2] !== 'sora_default' && parts[2] !== 'social_16_9') return '';
+  return buildSavedCatalogVariantKey({
+    published_download_mode: parts[0],
+    audio_mode: parts[1],
+    framing_mode: parts[2],
+  });
+}
+
+function normalizeSavedCatalogIdList(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const seen = new Set();
+  const normalized = [];
+  for (let index = 0; index < list.length; index += 1) {
+    const itemId = sanitizeIdToken(list[index], 256);
+    if (!itemId || seen.has(itemId)) continue;
+    seen.add(itemId);
+    normalized.push(itemId);
+  }
+  return normalized;
+}
+
+function createEmptySavedBackupCatalog() {
+  return {
+    ownDrafts: {},
+    ownPosts: {},
+    castInPosts: {},
+    castInDrafts: {},
+    characterPosts: {},
+    ownPrompts: [],
+    characterDrafts: {},
+  };
+}
+
+function normalizeSavedCatalogVariantEntry(raw) {
+  const normalized = {};
+  if (Array.isArray(raw)) {
+    const legacyIds = normalizeSavedCatalogIdList(raw);
+    if (legacyIds.length) {
+      normalized[buildSavedCatalogVariantKey({})] = legacyIds;
+    }
+    return normalized;
+  }
+  const source = isCatalogObject(raw) ? raw : {};
+  Object.keys(source).forEach((variantKey) => {
+    const normalizedVariantKey = normalizeSavedCatalogVariantKey(variantKey);
+    if (!normalizedVariantKey) return;
+    normalized[normalizedVariantKey] = normalizeSavedCatalogIdList(source[variantKey]);
+  });
+  return normalized;
+}
+
+function normalizeSavedCharacterCatalog(raw) {
+  const source = isCatalogObject(raw) ? raw : {};
+  const normalized = {};
+  Object.keys(source).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    if (!normalizedHandle) return;
+    normalized[normalizedHandle] = normalizeSavedCatalogVariantEntry(source[handle]);
+  });
+  return normalized;
+}
+
+function normalizeSavedBackupCatalog(raw) {
+  const source = isCatalogObject(raw) ? raw : {};
+  return {
+    ownDrafts: normalizeSavedCatalogVariantEntry(source.ownDrafts),
+    ownPosts: normalizeSavedCatalogVariantEntry(source.ownPosts),
+    castInPosts: normalizeSavedCatalogVariantEntry(source.castInPosts),
+    castInDrafts: normalizeSavedCatalogVariantEntry(source.castInDrafts),
+    characterPosts: normalizeSavedCharacterCatalog(source.characterPosts),
+    ownPrompts: normalizeSavedCatalogIdList(source.ownPrompts),
+    characterDrafts: normalizeSavedCharacterCatalog(source.characterDrafts),
+  };
+}
+
+function cloneSavedCatalogVariantSetMap(raw) {
+  const normalized = normalizeSavedCatalogVariantEntry(raw);
+  const setMap = {};
+  Object.keys(normalized).forEach((variantKey) => {
+    setMap[variantKey] = new Set(normalized[variantKey]);
+  });
+  return setMap;
+}
+
+function cloneSavedCharacterVariantSetMap(raw) {
+  const normalized = normalizeSavedCharacterCatalog(raw);
+  const setMap = {};
+  Object.keys(normalized).forEach((handle) => {
+    setMap[handle] = cloneSavedCatalogVariantSetMap(normalized[handle]);
+  });
+  return setMap;
+}
+
+function convertSavedVariantSetMapToCatalog(setMap) {
+  const normalized = {};
+  Object.keys(setMap || {}).forEach((variantKey) => {
+    const normalizedVariantKey = normalizeSavedCatalogVariantKey(variantKey);
+    if (!normalizedVariantKey) return;
+    normalized[normalizedVariantKey] = Array.from(setMap[variantKey] || []);
+  });
+  return normalized;
+}
+
+function convertSavedCharacterVariantSetMapToCatalog(setMap) {
+  const normalized = {};
+  Object.keys(setMap || {}).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    if (!normalizedHandle) return;
+    normalized[normalizedHandle] = convertSavedVariantSetMapToCatalog(setMap[handle]);
+  });
+  return normalized;
+}
+
+function recordSavedBackupItemsInCatalog(catalog, run, items) {
+  const nextCatalog = normalizeSavedBackupCatalog(catalog);
+  const variantKey = buildSavedCatalogVariantKey(run && run.settings);
+  const characterHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_handle);
+  const characterDraftsHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_drafts_handle);
+  const bucketSets = {
+    ownDrafts: cloneSavedCatalogVariantSetMap(nextCatalog.ownDrafts),
+    ownPosts: cloneSavedCatalogVariantSetMap(nextCatalog.ownPosts),
+    castInPosts: cloneSavedCatalogVariantSetMap(nextCatalog.castInPosts),
+    castInDrafts: cloneSavedCatalogVariantSetMap(nextCatalog.castInDrafts),
+    ownPrompts: new Set(nextCatalog.ownPrompts),
+  };
+  const characterSets = cloneSavedCharacterVariantSetMap(nextCatalog.characterPosts);
+  const characterDraftsSets = cloneSavedCharacterVariantSetMap(nextCatalog.characterDrafts);
+
+  if (!bucketSets.ownDrafts[variantKey]) bucketSets.ownDrafts[variantKey] = new Set();
+  if (!bucketSets.ownPosts[variantKey]) bucketSets.ownPosts[variantKey] = new Set();
+  if (!bucketSets.castInPosts[variantKey]) bucketSets.castInPosts[variantKey] = new Set();
+  if (!bucketSets.castInDrafts[variantKey]) bucketSets.castInDrafts[variantKey] = new Set();
+
+  const list = Array.isArray(items) ? items : [];
+  for (let index = 0; index < list.length; index += 1) {
+    const item = list[index];
+    const bucketKey = sanitizeString(item && item.bucket, 64) || '';
+    const itemId = sanitizeIdToken(item && item.id, 256);
+    if (!bucketKey || !itemId) continue;
+    if (bucketKey === 'characterPosts') {
+      if (!characterHandle) continue;
+      if (!characterSets[characterHandle]) characterSets[characterHandle] = {};
+      if (!characterSets[characterHandle][variantKey]) characterSets[characterHandle][variantKey] = new Set();
+      characterSets[characterHandle][variantKey].add(itemId);
+      continue;
+    }
+    if (bucketKey === 'characterDrafts') {
+      if (!characterDraftsHandle) continue;
+      if (!characterDraftsSets[characterDraftsHandle]) characterDraftsSets[characterDraftsHandle] = {};
+      if (!characterDraftsSets[characterDraftsHandle][variantKey]) characterDraftsSets[characterDraftsHandle][variantKey] = new Set();
+      characterDraftsSets[characterDraftsHandle][variantKey].add(itemId);
+      continue;
+    }
+    if (bucketKey === 'ownPrompts') {
+      bucketSets.ownPrompts.add(itemId);
+      continue;
+    }
+    if (!bucketSets[bucketKey]) continue;
+    bucketSets[bucketKey][variantKey].add(itemId);
+  }
+
+  return {
+    ownDrafts: convertSavedVariantSetMapToCatalog(bucketSets.ownDrafts),
+    ownPosts: convertSavedVariantSetMapToCatalog(bucketSets.ownPosts),
+    castInPosts: convertSavedVariantSetMapToCatalog(bucketSets.castInPosts),
+    castInDrafts: convertSavedVariantSetMapToCatalog(bucketSets.castInDrafts),
+    characterPosts: convertSavedCharacterVariantSetMapToCatalog(characterSets),
+    ownPrompts: Array.from(bucketSets.ownPrompts),
+    characterDrafts: convertSavedCharacterVariantSetMapToCatalog(characterDraftsSets),
+  };
+}
+
 function createEmptyScopedAccountState() {
   return {
     lastRunId: '',
     bucketCatalog: createEmptyBackupBucketCatalog(),
-    savedCatalog: createEmptyBackupBucketCatalog(),
+    savedCatalog: createEmptySavedBackupCatalog(),
     cacheResetCatalog: createEmptyCacheResetCatalog(),
     completeScanCatalog: createEmptyCompleteScanCatalog(),
     draftPublishUsage: createEmptyDraftPublishUsage(),
     draftSharedLinkCatalog: createEmptyDraftSharedLinkCatalog(),
     draftSharedLinkCatalogVersion: 0,
     scanResumeCatalog: createEmptyScanResumeCatalog(),
+    savedCatalogVersion: SAVED_CATALOG_VERSION,
     savedCatalogHydrated: false,
   };
 }
@@ -330,17 +512,19 @@ function normalizeScopedAccountState(raw) {
     normalizeScanResumeCatalog(source.scanResumeCatalog || createEmptyScanResumeCatalog()),
     source.draftResumeCatalog
   );
+  const savedCatalogVersion = Math.max(0, Math.floor(Number(source.savedCatalogVersion) || 0));
   return {
     lastRunId: sanitizeString(source.lastRunId, 128) || '',
     bucketCatalog: normalizeBackupBucketCatalog(source.bucketCatalog || createEmptyBackupBucketCatalog()),
-    savedCatalog: normalizeBackupBucketCatalog(source.savedCatalog || createEmptyBackupBucketCatalog()),
+    savedCatalog: normalizeSavedBackupCatalog(source.savedCatalog || createEmptySavedBackupCatalog()),
     cacheResetCatalog: normalizeCacheResetCatalog(source.cacheResetCatalog),
     completeScanCatalog: normalizeCompleteScanCatalog(source.completeScanCatalog),
     draftPublishUsage: ensureCurrentDraftPublishUsage(source.draftPublishUsage),
     draftSharedLinkCatalog: normalizeDraftSharedLinkCatalog(source.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog()),
     draftSharedLinkCatalogVersion: Math.max(0, Math.floor(Number(source.draftSharedLinkCatalogVersion) || 0)),
     scanResumeCatalog: scanResumeCatalog,
-    savedCatalogHydrated: source.savedCatalogHydrated === true,
+    savedCatalogVersion: savedCatalogVersion >= SAVED_CATALOG_VERSION ? savedCatalogVersion : 0,
+    savedCatalogHydrated: source.savedCatalogHydrated === true && savedCatalogVersion >= SAVED_CATALOG_VERSION,
   };
 }
 
@@ -375,7 +559,8 @@ function normalizeAccountStatesCatalog(raw, legacyState, legacyAccountKey) {
       draftSharedLinkCatalog: legacyState.draftSharedLinkCatalog,
       scanResumeCatalog: legacyState.scanResumeCatalog,
       draftResumeCatalog: legacyState.draftResumeCatalog,
-      savedCatalogHydrated: true,
+      savedCatalogVersion: legacyState.savedCatalogVersion,
+      savedCatalogHydrated: legacyState.savedCatalogHydrated === true,
     });
   }
 
@@ -582,11 +767,12 @@ function escapeCsvValue(value) {
 function buildPromptCsv(rows) {
   const lines = [
     '"All draft prompts with similar prompts de-duplicated!"',
-    'Prompt,Duration,Creation Date',
+    'Video,Prompt,Duration,Creation Date',
   ];
   for (let index = 0; index < rows.length; index += 1) {
     const row = rows[index];
     lines.push([
+      escapeCsvValue(row.fileName),
       escapeCsvValue(row.prompt),
       escapeCsvValue(row.duration),
       escapeCsvValue(row.createdAt),
@@ -644,12 +830,15 @@ function normalizeCompleteScanCatalog(raw) {
   return normalized;
 }
 const VIDEO_PROCESS_RETRY_COUNT = 2;
-const CLEARABLE_CACHE_BUCKETS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts'];
+const CLEARABLE_CACHE_MODE_KEYS = ['ownPosts', 'ownDrafts', 'ownPrompts', 'castInPosts', 'castInDrafts', 'postStats'];
+const CLEARABLE_CACHE_BUCKET_KEYS = ['ownPosts', 'ownDrafts', 'ownPrompts', 'castInPosts', 'castInDrafts'];
 const CLEARABLE_CACHE_LABELS = {
   ownPosts: 'My posts',
   ownDrafts: 'My drafts',
+  ownPrompts: 'My draft prompts',
   castInPosts: 'Cast-in posts',
   castInDrafts: 'Drafts of me',
+  postStats: 'My post stats',
 };
 
 function createEmptyCacheResetCatalog() {
@@ -659,7 +848,9 @@ function createEmptyCacheResetCatalog() {
     castInPosts: 0,
     castInDrafts: 0,
     characterPosts: {},
+    characterDrafts: {},
     ownPrompts: 0,
+    postStats: 0,
   };
 }
 
@@ -676,6 +867,7 @@ function normalizeCacheResetCatalog(raw) {
   normalized.castInPosts = normalizeCacheResetTimestamp(source.castInPosts);
   normalized.castInDrafts = normalizeCacheResetTimestamp(source.castInDrafts);
   normalized.ownPrompts = normalizeCacheResetTimestamp(source.ownPrompts);
+  normalized.postStats = normalizeCacheResetTimestamp(source.postStats);
   const rawCharacters = source.characterPosts && typeof source.characterPosts === 'object' && !Array.isArray(source.characterPosts)
     ? source.characterPosts
     : {};
@@ -683,6 +875,14 @@ function normalizeCacheResetCatalog(raw) {
     const normalizedHandle = normalizeCharacterHandle(handle);
     if (!normalizedHandle) return;
     normalized.characterPosts[normalizedHandle] = normalizeCacheResetTimestamp(rawCharacters[handle]);
+  });
+  const rawCharacterDrafts = source.characterDrafts && typeof source.characterDrafts === 'object' && !Array.isArray(source.characterDrafts)
+    ? source.characterDrafts
+    : {};
+  Object.keys(rawCharacterDrafts).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    if (!normalizedHandle) return;
+    normalized.characterDrafts[normalizedHandle] = normalizeCacheResetTimestamp(rawCharacterDrafts[handle]);
   });
   return normalized;
 }
@@ -781,8 +981,10 @@ class BackupService extends EventEmitter {
     this.currentJobPromise = null;
     this.ffmpegPath = '';
     this.ffmpegPathPromise = null;
-    this.activeAbortController = null;
+    this.activeAbortControllers = new Set();
+    this.activeForegroundOperation = null;
     this.sessionManualBearerToken = '';
+    this.draftPublishLock = Promise.resolve();
   }
 
   async initialize() {
@@ -868,13 +1070,14 @@ class BackupService extends EventEmitter {
     const scoped = this._ensureScopedAccountState(key);
     scoped.lastRunId = sanitizeString(this.state.lastRunId, 128) || '';
     scoped.bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
-    scoped.savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    scoped.savedCatalog = normalizeSavedBackupCatalog(this.state.savedCatalog || createEmptySavedBackupCatalog());
     scoped.cacheResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
     scoped.completeScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
     scoped.draftPublishUsage = ensureCurrentDraftPublishUsage(this.state.draftPublishUsage);
     scoped.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(this.state.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
     scoped.draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(this.state.draftSharedLinkCatalogVersion) || 0));
     scoped.scanResumeCatalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
+    scoped.savedCatalogVersion = SAVED_CATALOG_VERSION;
     scoped.savedCatalogHydrated = scoped.savedCatalogHydrated === true;
   }
 
@@ -884,13 +1087,15 @@ class BackupService extends EventEmitter {
     this.state.activeAccountKey = key;
     this.state.lastRunId = scoped.lastRunId || '';
     this.state.bucketCatalog = normalizeBackupBucketCatalog(scoped.bucketCatalog || createEmptyBackupBucketCatalog());
-    this.state.savedCatalog = normalizeBackupBucketCatalog(scoped.savedCatalog || createEmptyBackupBucketCatalog());
+    this.state.savedCatalog = normalizeSavedBackupCatalog(scoped.savedCatalog || createEmptySavedBackupCatalog());
     this.state.cacheResetCatalog = normalizeCacheResetCatalog(scoped.cacheResetCatalog);
     this.state.completeScanCatalog = normalizeCompleteScanCatalog(scoped.completeScanCatalog);
     this.state.draftPublishUsage = ensureCurrentDraftPublishUsage(scoped.draftPublishUsage);
     this.state.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(scoped.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
     this.state.draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(scoped.draftSharedLinkCatalogVersion) || 0));
     this.state.scanResumeCatalog = normalizeScanResumeCatalog(scoped.scanResumeCatalog || createEmptyScanResumeCatalog());
+    this.state.savedCatalogVersion = Math.max(0, Math.floor(Number(scoped.savedCatalogVersion) || 0));
+    this.state.savedCatalogHydrated = scoped.savedCatalogHydrated === true;
   }
 
   _activateAccountState(accountKey, options) {
@@ -976,7 +1181,7 @@ class BackupService extends EventEmitter {
       new Set(
         rawModes
           .map((value) => sanitizeString(String(value || ''), 64) || '')
-          .filter((value) => CLEARABLE_CACHE_BUCKETS.indexOf(value) >= 0)
+          .filter((value) => CLEARABLE_CACHE_MODE_KEYS.indexOf(value) >= 0)
       )
     );
     const characters = Array.from(
@@ -992,7 +1197,7 @@ class BackupService extends EventEmitter {
     }
 
     const nextBucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
-    const nextSavedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const nextSavedCatalog = normalizeSavedBackupCatalog(this.state.savedCatalog || createEmptySavedBackupCatalog());
     const nextResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
     const nextCompleteScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
     const nextScanResumeCatalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
@@ -1000,24 +1205,33 @@ class BackupService extends EventEmitter {
 
     for (let index = 0; index < modes.length; index += 1) {
       const bucketKey = modes[index];
-      nextBucketCatalog[bucketKey] = [];
-      nextSavedCatalog[bucketKey] = [];
-      nextResetCatalog[bucketKey] = resetAt;
-      if (Object.prototype.hasOwnProperty.call(nextCompleteScanCatalog, bucketKey)) {
-        nextCompleteScanCatalog[bucketKey] = null;
-      }
-      if (Object.prototype.hasOwnProperty.call(nextScanResumeCatalog, bucketKey)) {
-        nextScanResumeCatalog[bucketKey] = null;
+      if (CLEARABLE_CACHE_BUCKET_KEYS.indexOf(bucketKey) >= 0) {
+        nextBucketCatalog[bucketKey] = [];
+        nextSavedCatalog[bucketKey] = bucketKey === 'ownPrompts' ? [] : {};
+        nextResetCatalog[bucketKey] = resetAt;
+        if (Object.prototype.hasOwnProperty.call(nextCompleteScanCatalog, bucketKey)) {
+          nextCompleteScanCatalog[bucketKey] = null;
+        }
+        if (Object.prototype.hasOwnProperty.call(nextScanResumeCatalog, bucketKey)) {
+          nextScanResumeCatalog[bucketKey] = null;
+        }
+      } else if (bucketKey === 'postStats') {
+        nextResetCatalog.postStats = resetAt;
       }
     }
 
     for (let index = 0; index < characters.length; index += 1) {
       const handle = characters[index];
       delete nextBucketCatalog.characterPosts[handle];
+      delete nextBucketCatalog.characterDrafts[handle];
       delete nextSavedCatalog.characterPosts[handle];
+      delete nextSavedCatalog.characterDrafts[handle];
       delete nextCompleteScanCatalog.characterPosts[handle];
+      delete nextCompleteScanCatalog.characterDrafts[handle];
       delete nextScanResumeCatalog.characterPosts[handle];
+      delete nextScanResumeCatalog.characterDrafts[handle];
       nextResetCatalog.characterPosts[handle] = resetAt;
+      nextResetCatalog.characterDrafts[handle] = resetAt;
     }
 
     this.state.bucketCatalog = nextBucketCatalog;
@@ -1060,10 +1274,6 @@ class BackupService extends EventEmitter {
     this.state.settings = nextSettings;
     this._setSessionManualBearerToken(nextManualBearerToken);
     await this.session.setManualAuth(this._getSessionManualBearerToken(), nextSettings.manual_cookie_header);
-    logAuthState('updateSettings saved', {
-      cookieHeader: nextSettings.manual_cookie_header,
-      bearerToken: this._getSessionManualBearerToken(),
-    });
     await this._saveState();
     return this._buildPublicSettings();
   }
@@ -1207,6 +1417,9 @@ class BackupService extends EventEmitter {
 
     const scopes = normalizeBackupScopes(payload && payload.scopes ? payload.scopes : DEFAULT_BACKUP_SCOPES);
     const settings = normalizeBackupRequestSettings(payload && payload.settings ? payload.settings : this.state.settings);
+    if ((scopes.castInDrafts || scopes.characterDrafts) && settings.published_download_mode === 'smart') {
+      settings.published_download_mode = 'direct_sora';
+    }
     settings.downloadDir = payload && payload.downloadDir ? payload.downloadDir : this.state.settings.downloadDir;
     await this.updateSettings({
       downloadDir: settings.downloadDir,
@@ -1224,15 +1437,10 @@ class BackupService extends EventEmitter {
     }
     if (backupRequiresManualDraftCookie(scopes, settings)) {
       const activeAuth = this._getActiveManualDraftAuth();
-      logAuthState('startBackup auth check', {
-        cookieHeader: activeAuth.manualCookieHeader,
-        bearerToken: activeAuth.manualBearerToken,
-      });
       if (!hasRequiredManualDraftAuth(Object.assign({}, this.state && this.state.settings, {
         manual_bearer_token: activeAuth.manualBearerToken,
         manual_cookie_header: activeAuth.manualCookieHeader,
       }))) {
-        console.log('[draft-auth] startBackup REJECTED — missing cookie or bearer');
         return { ok: false, error: 'backup_draft_manual_auth_required' };
       }
     }
@@ -1271,7 +1479,13 @@ class BackupService extends EventEmitter {
   }
 
   async cancelBackup() {
+    if (this.activeForegroundOperation) {
+      this.activeForegroundOperation.cancelRequested = true;
+    }
     if (!this.currentJob || isTerminalRunStatus(this.currentJob.run.status)) {
+      if (this.activeForegroundOperation) {
+        this._abortActiveWork();
+      }
       const lastRunId = this.state && this.state.lastRunId;
       const lastRun = lastRunId ? await this.store.getRun(lastRunId) : null;
       if (lastRun && !isTerminalRunStatus(lastRun.status)) {
@@ -1292,6 +1506,35 @@ class BackupService extends EventEmitter {
     await this.store.saveRun(this.currentJob.run);
     this._emitStatus(this.currentJob);
     return { ok: true, run: summarizeBackupRun(this.currentJob.run) };
+  }
+
+  async _runCancelableForegroundOperation(kind, executor) {
+    if (this.activeForegroundOperation) {
+      throw new Error('foreground_operation_in_progress');
+    }
+    const operation = {
+      kind: sanitizeString(kind, 64) || 'foreground_operation',
+      cancelRequested: false,
+    };
+    this.activeForegroundOperation = operation;
+    try {
+      return await executor(operation);
+    } catch (error) {
+      if (operation.cancelRequested && !(error instanceof BackupCancelledError)) {
+        throw new BackupCancelledError();
+      }
+      throw error;
+    } finally {
+      if (this.activeForegroundOperation === operation) {
+        this.activeForegroundOperation = null;
+      }
+    }
+  }
+
+  _throwIfForegroundOperationCancelled(operation) {
+    if (operation && operation.cancelRequested) {
+      throw new BackupCancelledError();
+    }
   }
 
   async exportManifest(runId, format) {
@@ -1438,7 +1681,9 @@ class BackupService extends EventEmitter {
       await this.store.saveRun(job.run);
       this._emitStatus(job);
 
-      const resumeEntry = this._getScanResumeEntry(job.run, bucket.key);
+      const resumeEntry = this._supportsCrossRunScanResumeCache(bucket.key)
+        ? this._getScanResumeEntry(job.run, bucket.key)
+        : null;
       if (resumeEntry && resumeEntry.runId && resumeEntry.runId !== job.run.id) {
         this._setRunDiagnostic(job, {
           phase: 'resuming',
@@ -1512,6 +1757,7 @@ class BackupService extends EventEmitter {
           } else if (bucket.key === 'characterDrafts') {
             json = await this.session.fetchCharacterDraftsJson(bucket.character_drafts_handle, params, { signal: this._createActiveAbortSignal() });
           } else {
+            if (!bucket.pathname) throw new Error('backup_bucket_missing_pathname');
             const response = await this.session.fetchJson(bucket.pathname, params, { signal: this._createActiveAbortSignal() });
             json = response.json || {};
           }
@@ -1568,7 +1814,7 @@ class BackupService extends EventEmitter {
 
         const nextCursor = extractCursorFromPayload(json);
         await this.store.saveItems(job.run.id, job.items);
-        if (nextCursor) {
+        if (nextCursor && this._supportsCrossRunScanResumeCache(bucket.key)) {
           await this._setScanResumeEntry(job.run, bucket.key, {
             runId: job.run.id,
             nextCursor: nextCursor,
@@ -1737,6 +1983,7 @@ class BackupService extends EventEmitter {
         similarityPrompt: similarityPrompt,
       });
       uniqueRows.push({
+        fileName: sanitizeString(item && item.id, 256) || '',
         prompt: displayPrompt,
         duration: formatPromptCsvDuration(item.duration_s),
         createdAt: formatPromptCsvDate(item.created_at),
@@ -1763,6 +2010,46 @@ class BackupService extends EventEmitter {
   }
 
   async _downloadQueuedItems(job) {
+    const concurrency = this._getDownloadConcurrency(job);
+    if (concurrency > 1) {
+      await this._downloadQueuedItemsConcurrently(job, concurrency);
+      return;
+    }
+    await this._downloadQueuedItemsSequential(job);
+  }
+
+  _getDownloadConcurrency(job) {
+    const selectedScope = sanitizeString(job && job.run && job.run.settings && job.run.settings.selectedScope, 64) || '';
+    const publishedDownloadMode = sanitizeString(job && job.run && job.run.settings && job.run.settings.published_download_mode, 64) || '';
+    return selectedScope === 'ownDrafts' && publishedDownloadMode === 'smart'
+      ? OWN_DRAFTS_DOWNLOAD_CONCURRENCY
+      : 1;
+  }
+
+  async _downloadQueuedItemsConcurrently(job, concurrency) {
+    const workerCount = Math.max(1, Math.floor(Number(concurrency) || 1));
+    let cursor = 0;
+    const nextEntry = () => {
+      const entry = this._takeNextQueuedItem(job, cursor);
+      if (!entry) return null;
+      cursor = entry.nextIndex;
+      return entry;
+    };
+    const workers = [];
+    for (let workerIndex = 0; workerIndex < workerCount; workerIndex += 1) {
+      workers.push((async () => {
+        while (true) {
+          if (job.cancelRequested || job.draftPublishLimitReached) return;
+          const entry = nextEntry();
+          if (!entry) return;
+          await this._processQueuedDownloadEntry(job, entry);
+        }
+      })());
+    }
+    await Promise.all(workers);
+  }
+
+  async _downloadQueuedItemsSequential(job) {
     const audioMode = normalizeBackupAudioMode(job && job.run && job.run.settings && job.run.settings.audio_mode);
     const framingMode = normalizeBackupFramingMode(job && job.run && job.run.settings && job.run.settings.framing_mode);
     const publishedDownloadMode = job && job.run && job.run.settings && job.run.settings.published_download_mode;
@@ -1771,139 +2058,147 @@ class BackupService extends EventEmitter {
     while (true) {
       const nextEntry = this._takeNextQueuedItem(job, index);
       if (!nextEntry) break;
-      const item = nextEntry.item;
       index = nextEntry.nextIndex;
-      if (normalizeItemStatus(item.status) !== 'queued') continue;
-      this._throwIfCancelled(job);
+      await this._processQueuedDownloadEntry(job, nextEntry);
+    }
+  }
 
-      const preparedItem = await this._refreshBackupItemMedia(job.run, item);
-      const canUseSmartProviders =
-        publishedDownloadMode === 'smart' &&
-        preparedItem &&
-        (preparedItem.kind === 'draft' || preparedItem.kind === 'published');
-      const requiresSmartDownloadProvider =
-        this._requiresSmartDownloadProvider(preparedItem, publishedDownloadMode) ||
-        this._shouldForceSmartDownloadProvider(job, preparedItem);
-      if (!preparedItem.media_url && !canUseSmartProviders) {
-        this._clearSmartDownloadRetryState(job, preparedItem);
-        this._clearSmartDownloadProviderFallback(job, preparedItem);
-        this._transitionItem(job, preparedItem, 'failed', {
-          last_error: preparedItem.last_error || 'missing_media_url',
+  async _processQueuedDownloadEntry(job, nextEntry) {
+    const audioMode = normalizeBackupAudioMode(job && job.run && job.run.settings && job.run.settings.audio_mode);
+    const framingMode = normalizeBackupFramingMode(job && job.run && job.run.settings && job.run.settings.framing_mode);
+    const publishedDownloadMode = job && job.run && job.run.settings && job.run.settings.published_download_mode;
+    const shouldProcessVideo = audioMode === 'no_audiomark' || framingMode === 'social_16_9';
+    const item = nextEntry && nextEntry.item;
+    if (!item || normalizeItemStatus(item.status) !== 'queued') return;
+    this._throwIfCancelled(job);
+
+    const preparedItem = await this._refreshBackupItemMedia(job.run, item);
+    const canUseSmartProviders =
+      publishedDownloadMode === 'smart' &&
+      preparedItem &&
+      (preparedItem.kind === 'draft' || preparedItem.kind === 'published');
+    const requiresSmartDownloadProvider =
+      this._requiresSmartDownloadProvider(preparedItem, publishedDownloadMode) ||
+      this._shouldForceSmartDownloadProvider(job, preparedItem);
+    if (!preparedItem.media_url && !canUseSmartProviders) {
+      this._clearSmartDownloadRetryState(job, preparedItem);
+      this._clearSmartDownloadProviderFallback(job, preparedItem);
+      this._transitionItem(job, preparedItem, 'failed', {
+        last_error: preparedItem.last_error || 'missing_media_url',
+      });
+      await this._persistJob(job, false);
+      this._emitStatus(job);
+      return;
+    }
+
+    const overloadWaitMs = requiresSmartDownloadProvider
+      ? this._getSmartDownloadOverloadWaitMs(job)
+      : 0;
+    if (overloadWaitMs > 0) {
+      if (nextEntry.source === 'items') {
+        this._queueDeferredSmartDownloadItem(job, preparedItem);
+        return;
+      }
+      await this._waitForSmartDownloadRecovery(job);
+    }
+
+    this._transitionItem(job, preparedItem, 'downloading', {
+      attempts: (Number(preparedItem.attempts) || 0) + 1,
+      last_error: '',
+    });
+    this._setRunDiagnostic(job, {
+      phase: 'downloading',
+      bucket: preparedItem.bucket,
+      reason: 'Downloading ' + preparedItem.id + '.',
+    });
+    job.run.summary_text = 'Downloading ' + preparedItem.id + '…';
+    await this._persistJob(job, false);
+    this._emitStatus(job);
+
+    const destinationPath = path.join(job.run.download_dir || this.state.settings.downloadDir, preparedItem.filename);
+    const tempDownloadPath = shouldProcessVideo
+      ? buildIntermediateDownloadPath(destinationPath, preparedItem.media_ext)
+      : destinationPath;
+    const existingOutputBackupPath = await this._stageExistingOutputFile(destinationPath);
+    let downloadRequest = null;
+    let doneOverrides = { last_error: '' };
+    try {
+      downloadRequest = await this._resolveDownloadRequest(job, preparedItem, publishedDownloadMode);
+      await this._applyWatermarkDownloadThrottle(job, publishedDownloadMode);
+      await downloadToFile(downloadRequest.url, tempDownloadPath, {
+        acceptVideoOnErrorStatus: downloadRequest.acceptVideoOnErrorStatus,
+        headers: downloadRequest.headers,
+        requireVideoContentType: downloadRequest.requireVideoContentType,
+        signal: this._createActiveAbortSignal(),
+      });
+      await this._assertDownloadLooksUsable(job, preparedItem, downloadRequest, tempDownloadPath, publishedDownloadMode);
+      if (shouldProcessVideo) {
+        this._setRunDiagnostic(job, {
+          phase: 'processing_video',
+          bucket: preparedItem.bucket,
+          reason: this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode),
         });
+        job.run.summary_text = this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode);
         await this._persistJob(job, false);
         this._emitStatus(job);
-        continue;
-      }
-
-      const overloadWaitMs = requiresSmartDownloadProvider
-        ? this._getSmartDownloadOverloadWaitMs(job)
-        : 0;
-      if (overloadWaitMs > 0) {
-        if (nextEntry.source === 'items') {
-          this._queueDeferredSmartDownloadItem(job, preparedItem);
-          continue;
-        }
-        await this._waitForSmartDownloadRecovery(job);
-      }
-
-      this._transitionItem(job, preparedItem, 'downloading', {
-        attempts: (Number(preparedItem.attempts) || 0) + 1,
-        last_error: '',
-      });
-      this._setRunDiagnostic(job, {
-        phase: 'downloading',
-        bucket: preparedItem.bucket,
-        reason: 'Downloading ' + preparedItem.id + '.',
-      });
-      job.run.summary_text = 'Downloading ' + preparedItem.id + '…';
-      await this._persistJob(job, false);
-      this._emitStatus(job);
-
-      const destinationPath = path.join(job.run.download_dir || this.state.settings.downloadDir, preparedItem.filename);
-      const tempDownloadPath = shouldProcessVideo
-        ? buildIntermediateDownloadPath(destinationPath, preparedItem.media_ext)
-        : destinationPath;
-      const existingOutputBackupPath = await this._stageExistingOutputFile(destinationPath);
-      let downloadRequest = null;
-      let doneOverrides = { last_error: '' };
-      try {
-        downloadRequest = await this._resolveDownloadRequest(job, preparedItem, publishedDownloadMode);
-        await this._applyWatermarkDownloadThrottle(job, publishedDownloadMode);
-        await downloadToFile(downloadRequest.url, tempDownloadPath, {
-          acceptVideoOnErrorStatus: downloadRequest.acceptVideoOnErrorStatus,
-          headers: downloadRequest.headers,
-          requireVideoContentType: downloadRequest.requireVideoContentType,
-          signal: this._createActiveAbortSignal(),
+        const processingOutcome = await this._processVideoWithRecovery(job, preparedItem, tempDownloadPath, destinationPath, {
+          audioMode: audioMode,
+          framingMode: framingMode,
+          width: preparedItem.width,
+          height: preparedItem.height,
         });
-        await this._assertDownloadLooksUsable(job, preparedItem, downloadRequest, tempDownloadPath, publishedDownloadMode);
-        if (shouldProcessVideo) {
-          this._setRunDiagnostic(job, {
-            phase: 'processing_video',
-            bucket: preparedItem.bucket,
-            reason: this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode),
-          });
-          job.run.summary_text = this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode);
-          await this._persistJob(job, false);
-          this._emitStatus(job);
-          const processingOutcome = await this._processVideoWithRecovery(job, preparedItem, tempDownloadPath, destinationPath, {
-            audioMode: audioMode,
-            framingMode: framingMode,
-            width: preparedItem.width,
-            height: preparedItem.height,
-          });
-          doneOverrides = processingOutcome && processingOutcome.itemOverrides
-            ? processingOutcome.itemOverrides
-            : doneOverrides;
-        }
-        await this._cleanupDraftPublishedPost(job, preparedItem);
-        await this._discardStagedOutputFile(existingOutputBackupPath);
-        this._resetSmartDownloadFailures(job, preparedItem);
-        this._transitionItem(job, preparedItem, 'done', doneOverrides);
-      } catch (error) {
-        if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
-          await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
-          throw new BackupCancelledError();
-        }
-        if (error && error.draftPublishLimitReached) {
-          await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
-          this._clearSmartDownloadRetryState(job, preparedItem);
-          this._clearSmartDownloadProviderFallback(job, preparedItem);
-          this._transitionItem(job, preparedItem, 'queued', {
-            last_error: sanitizeString(String(error.userMessage || error.message || ''), 1024) || '',
-          });
-          job.draftPublishLimitReached = true;
-          this._setRunDiagnostic(job, {
-            phase: 'draft_limit_reached',
-            bucket: preparedItem.bucket,
-            reason: sanitizeString(String(error.userMessage || error.message || ''), 1024) || 'Draft copy-link limit reached.',
-          });
-          job.run.last_error = sanitizeString(String(error.userMessage || error.message || ''), 1024) || '';
-          job.run.summary_text = job.run.last_error || 'Draft copy-link limit reached. Resume tomorrow.';
-          await this._persistJob(job, false);
-          this._emitStatus(job);
-          break;
-        }
-        await this._removeFileIfPresent(tempDownloadPath);
-        if (shouldProcessVideo && destinationPath !== tempDownloadPath) {
-          await this._removeFileIfPresent(destinationPath);
-        }
+        doneOverrides = processingOutcome && processingOutcome.itemOverrides
+          ? processingOutcome.itemOverrides
+          : doneOverrides;
+      }
+      await this._cleanupDraftPublishedPost(job, preparedItem);
+      await this._discardStagedOutputFile(existingOutputBackupPath);
+      this._resetSmartDownloadFailures(job, preparedItem);
+      this._transitionItem(job, preparedItem, 'done', doneOverrides);
+    } catch (error) {
+      if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
         await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
-        const handledSmartFailure = await this._handleSmartDownloadFailure(job, preparedItem, error, downloadRequest, publishedDownloadMode);
-        if (handledSmartFailure) {
-          await this._persistJob(job, false);
-          this._emitStatus(job);
-          continue;
-        }
+        throw new BackupCancelledError();
+      }
+      if (error && error.draftPublishLimitReached) {
+        await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
         this._clearSmartDownloadRetryState(job, preparedItem);
         this._clearSmartDownloadProviderFallback(job, preparedItem);
-        this._transitionItem(job, preparedItem, 'failed', {
-          last_error: sanitizeString(String((error && (error.userMessage || error.message)) || error || 'download_failed'), 1024) || 'download_failed',
+        this._transitionItem(job, preparedItem, 'queued', {
+          last_error: sanitizeString(String(error.userMessage || error.message || ''), 1024) || '',
         });
+        job.draftPublishLimitReached = true;
+        this._setRunDiagnostic(job, {
+          phase: 'draft_limit_reached',
+          bucket: preparedItem.bucket,
+          reason: sanitizeString(String(error.userMessage || error.message || ''), 1024) || 'Draft copy-link limit reached.',
+        });
+        job.run.last_error = sanitizeString(String(error.userMessage || error.message || ''), 1024) || '';
+        job.run.summary_text = job.run.last_error || 'Draft copy-link limit reached. Resume tomorrow.';
+        await this._persistJob(job, false);
+        this._emitStatus(job);
+        return;
       }
-
-      await this._persistJob(job, false);
-      this._emitStatus(job);
+      await this._removeFileIfPresent(tempDownloadPath);
+      if (shouldProcessVideo && destinationPath !== tempDownloadPath) {
+        await this._removeFileIfPresent(destinationPath);
+      }
+      await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
+      const handledSmartFailure = await this._handleSmartDownloadFailure(job, preparedItem, error, downloadRequest, publishedDownloadMode);
+      if (handledSmartFailure) {
+        await this._persistJob(job, false);
+        this._emitStatus(job);
+        return;
+      }
+      this._clearSmartDownloadRetryState(job, preparedItem);
+      this._clearSmartDownloadProviderFallback(job, preparedItem);
+      this._transitionItem(job, preparedItem, 'failed', {
+        last_error: sanitizeString(String((error && (error.userMessage || error.message)) || error || 'download_failed'), 1024) || 'download_failed',
+      });
     }
+
+    await this._persistJob(job, false);
+    this._emitStatus(job);
   }
 
   async _resolveDownloadRequest(job, item, publishedDownloadMode) {
@@ -2192,7 +2487,13 @@ class BackupService extends EventEmitter {
   }
 
   _supportsCompleteScanCache(bucketKey) {
-    return this._shouldTrackSavedItem(bucketKey);
+    const key = sanitizeString(bucketKey, 64) || '';
+    return key === 'ownDrafts' || key === 'castInDrafts' || key === 'characterDrafts' || key === 'ownPrompts';
+  }
+
+  _supportsCrossRunScanResumeCache(bucketKey) {
+    const key = sanitizeString(bucketKey, 64) || '';
+    return key === 'ownDrafts' || key === 'castInDrafts' || key === 'characterDrafts' || key === 'ownPrompts';
   }
 
   _buildDraftPublishLimitMessage(usage) {
@@ -2448,15 +2749,19 @@ class BackupService extends EventEmitter {
         ) || '';
         item.temp_public_post_cleanup_error = '';
         await this._recordDraftPublishSuccess(job);
-        await this._waitForDelay(DRAFT_LINK_PUBLISH_SETTLE_MS);
         return item;
       }
 
       lastErrorMessage = sanitizeString(
-        response.error || ((response.status > 0) ? ('backup_http_' + response.status) : 'draft_publish_failed'),
+        response.error || (
+          response.ok
+            ? 'draft_shared_link_not_ready'
+            : ((response.status > 0) ? ('backup_http_' + response.status) : 'draft_publish_failed')
+        ),
         1024
       ) || 'draft_publish_failed';
       const retryableStatus =
+        response.ok === true ||
         Number(response.status) === 0 ||
         (Number(response.status) === 403 && /just a moment/i.test(String(response.text || '')));
       if (attempt >= DRAFT_LINK_PUBLISH_MAX_ATTEMPTS || !retryableStatus) break;
@@ -2479,7 +2784,26 @@ class BackupService extends EventEmitter {
       }
       await this._forgetDraftSharedLink(item);
     }
-    return this._publishDraftSharedLink(job, item);
+    const publishedItem = await this._runWithDraftPublishLock(() => this._publishDraftSharedLink(job, item));
+    if (publishedItem && publishedItem.temp_public_post_id) {
+      await this._waitForDelay(DRAFT_LINK_PUBLISH_SETTLE_MS);
+    }
+    return publishedItem;
+  }
+
+  async _runWithDraftPublishLock(worker) {
+    const task = typeof worker === 'function' ? worker : async () => {};
+    const previous = this.draftPublishLock || Promise.resolve();
+    let release;
+    this.draftPublishLock = new Promise((resolve) => {
+      release = resolve;
+    });
+    await previous.catch(() => {});
+    try {
+      return await task();
+    } finally {
+      release();
+    }
   }
 
   async _cleanupDraftPublishedPost(job, item) {
@@ -2809,16 +3133,14 @@ class BackupService extends EventEmitter {
 
   async _waitForDelay(waitMs) {
     if (!(waitMs > 0)) return;
-    const signal = this._createActiveAbortSignal();
+    const { controller, signal } = this._createActiveAbortHandle();
     await new Promise((resolve, reject) => {
       let settled = false;
       let timeoutId = null;
       const cleanup = () => {
         if (timeoutId) clearTimeout(timeoutId);
         signal.removeEventListener('abort', onAbort);
-        if (this.activeAbortController && this.activeAbortController.signal === signal) {
-          this.activeAbortController = null;
-        }
+        this._clearActiveAbortController(controller);
       };
       const onAbort = () => {
         if (settled) return;
@@ -2881,18 +3203,30 @@ class BackupService extends EventEmitter {
     await this._removeFileIfPresent(backupPath);
   }
 
-  _createActiveAbortSignal() {
+  _createActiveAbortHandle() {
     const controller = new AbortController();
-    this.activeAbortController = controller;
-    return controller.signal;
+    this.activeAbortControllers.add(controller);
+    return { controller, signal: controller.signal };
+  }
+
+  _createActiveAbortSignal() {
+    return this._createActiveAbortHandle().signal;
+  }
+
+  _clearActiveAbortController(controller) {
+    if (!controller || !this.activeAbortControllers) return;
+    this.activeAbortControllers.delete(controller);
   }
 
   _abortActiveWork() {
-    if (this.activeAbortController) {
-      try {
-        this.activeAbortController.abort();
-      } catch (_error) {}
-      this.activeAbortController = null;
+    if (this.activeAbortControllers && this.activeAbortControllers.size) {
+      const controllers = Array.from(this.activeAbortControllers);
+      this.activeAbortControllers.clear();
+      for (let index = 0; index < controllers.length; index += 1) {
+        try {
+          controllers[index].abort();
+        } catch (_error) {}
+      }
     }
     if (this.session && this.session.abortActiveRequest) {
       this.session.abortActiveRequest();
@@ -2910,6 +3244,7 @@ class BackupService extends EventEmitter {
       deferredItems: [],
       deferredItemKeys: new Set(),
       forceProviderItemKeys: new Set(),
+      itemAttemptedProviderIds: new Map(),
       itemRetryCounts: new Map(),
       maxRetriesPerItem: Math.max(2, providers.length * 2),
       flushDeferredNow: false,
@@ -3019,10 +3354,33 @@ class BackupService extends EventEmitter {
     smartDownload.deferredItems.push(item);
   }
 
+  _recordSmartDownloadProviderAttempt(job, item, providerId) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return 0;
+    const normalizedProviderId = sanitizeString(String(providerId || ''), 64) || '';
+    if (!normalizedProviderId) return 0;
+    let attemptedProviderIds = smartDownload.itemAttemptedProviderIds.get(item.item_key);
+    if (!(attemptedProviderIds instanceof Set)) {
+      attemptedProviderIds = new Set();
+      smartDownload.itemAttemptedProviderIds.set(item.item_key, attemptedProviderIds);
+    }
+    attemptedProviderIds.add(normalizedProviderId);
+    return attemptedProviderIds.size;
+  }
+
+  _hasTriedAllSmartDownloadProviders(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return false;
+    const attemptedProviderIds = smartDownload.itemAttemptedProviderIds.get(item.item_key);
+    if (!(attemptedProviderIds instanceof Set) || !attemptedProviderIds.size) return false;
+    return attemptedProviderIds.size >= smartDownload.providers.length;
+  }
+
   _clearSmartDownloadRetryState(job, item) {
     const smartDownload = this._getSmartDownloadState(job);
     if (!smartDownload || !item || !item.item_key) return;
     smartDownload.itemRetryCounts.delete(item.item_key);
+    smartDownload.itemAttemptedProviderIds.delete(item.item_key);
   }
 
   _clearSmartDownloadProviderFallback(job, item) {
@@ -3075,6 +3433,24 @@ class BackupService extends EventEmitter {
     return true;
   }
 
+  _shouldSwitchSmartDownloadProviderImmediately(job, error, downloadRequest) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || smartDownload.providers.length < 2) return false;
+    const failedProviderId =
+      sanitizeString(
+        String(
+          (error && error.smartProviderId) ||
+          (downloadRequest && downloadRequest.providerId) ||
+          ''
+        ),
+        64
+      ) || '';
+    if (!failedProviderId) return false;
+    const activeProvider = smartDownload.providers[smartDownload.activeProviderIndex];
+    if (!activeProvider || activeProvider.id !== failedProviderId) return false;
+    return smartDownload.activeProviderIndex < (smartDownload.providers.length - 1);
+  }
+
   async _handleSmartDownloadFailure(job, item, error, downloadRequest, publishedDownloadMode) {
     const eligibleSmartItem = this._canRetryViaSmartProvider(job, item, publishedDownloadMode);
     if (publishedDownloadMode !== 'smart' || !eligibleSmartItem) {
@@ -3091,16 +3467,24 @@ class BackupService extends EventEmitter {
 
     const retryCount = (smartDownload.itemRetryCounts.get(item.item_key) || 0) + 1;
     smartDownload.itemRetryCounts.set(item.item_key, retryCount);
+    this._recordSmartDownloadProviderAttempt(
+      job,
+      item,
+      (error && error.smartProviderId) || (downloadRequest && downloadRequest.providerId) || ''
+    );
     if (error && error.smartFallbackToProvider) {
       this._markItemForSmartProviderFallback(job, item);
       smartDownload.consecutiveFailures = 0;
     } else {
       smartDownload.consecutiveFailures += 1;
     }
-    const shouldRetryItem = retryCount < smartDownload.maxRetriesPerItem;
+    const shouldRetryItem =
+      retryCount < smartDownload.maxRetriesPerItem &&
+      !this._hasTriedAllSmartDownloadProviders(job, item);
     const shouldSwitchProvider =
       !(error && error.smartFallbackToProvider) &&
       (
+        this._shouldSwitchSmartDownloadProviderImmediately(job, error, downloadRequest) ||
         !!(error && error.smartProviderShouldSwitch) ||
         smartDownload.consecutiveFailures >= 2
       );
@@ -3267,15 +3651,30 @@ class BackupService extends EventEmitter {
   }
 
   _buildSavedIdSetsForRun(run) {
-    const savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const savedCatalog = normalizeSavedBackupCatalog(this.state.savedCatalog || createEmptySavedBackupCatalog());
+    const variantKey = buildSavedCatalogVariantKey(run && run.settings);
     const characterHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_handle);
+    const characterDraftsHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_drafts_handle);
     return {
-      ownDrafts: new Set(savedCatalog.ownDrafts),
-      ownPosts: new Set(savedCatalog.ownPosts),
-      castInPosts: new Set(savedCatalog.castInPosts),
-      castInDrafts: new Set(savedCatalog.castInDrafts),
+      ownDrafts: new Set(savedCatalog.ownDrafts[variantKey] || []),
+      ownPosts: new Set(savedCatalog.ownPosts[variantKey] || []),
+      castInPosts: new Set(savedCatalog.castInPosts[variantKey] || []),
+      castInDrafts: new Set(savedCatalog.castInDrafts[variantKey] || []),
       ownPrompts: new Set(savedCatalog.ownPrompts),
-      characterPosts: new Set(characterHandle ? (savedCatalog.characterPosts[characterHandle] || []) : []),
+      characterPosts: new Set(
+        characterHandle &&
+        savedCatalog.characterPosts[characterHandle] &&
+        savedCatalog.characterPosts[characterHandle][variantKey]
+          ? savedCatalog.characterPosts[characterHandle][variantKey]
+          : []
+      ),
+      characterDrafts: new Set(
+        characterDraftsHandle &&
+        savedCatalog.characterDrafts[characterDraftsHandle] &&
+        savedCatalog.characterDrafts[characterDraftsHandle][variantKey]
+          ? savedCatalog.characterDrafts[characterDraftsHandle][variantKey]
+          : []
+      ),
     };
   }
 
@@ -3286,7 +3685,8 @@ class BackupService extends EventEmitter {
       key === 'ownDrafts' ||
       key === 'castInPosts' ||
       key === 'castInDrafts' ||
-      key === 'characterPosts'
+      key === 'characterPosts' ||
+      key === 'characterDrafts'
     );
   }
 
@@ -3306,7 +3706,7 @@ class BackupService extends EventEmitter {
 
   async _refreshSavedCatalog(job) {
     const doneItems = (job.items || []).filter((item) => normalizeItemStatus(item && item.status) === 'done');
-    const nextCatalog = recordBackupItemsInBucketCatalog(this.state.savedCatalog, job.run, doneItems);
+    const nextCatalog = recordSavedBackupItemsInCatalog(this.state.savedCatalog, job.run, doneItems);
     const previousSerialized = JSON.stringify(this.state.savedCatalog || {});
     const nextSerialized = JSON.stringify(nextCatalog);
     if (previousSerialized === nextSerialized) return;
@@ -3315,21 +3715,29 @@ class BackupService extends EventEmitter {
   }
 
   _shouldDownloadIncrementalBatch(bucketKey) {
+    return this._getIncrementalBatchThreshold(bucketKey) > 0;
+  }
+
+  _getIncrementalBatchThreshold(bucketKey) {
     const key = sanitizeString(bucketKey, 64) || '';
-    return key === 'ownDrafts' || key === 'castInPosts' || key === 'castInDrafts' || key === 'characterPosts';
+    if (key === 'characterPosts' || key === 'characterDrafts') return 1000;
+    if (key === 'ownDrafts' || key === 'castInDrafts' || key === 'castInPosts') return 100;
+    return 0;
   }
 
   async _downloadIncrementalBatch(job, bucket) {
+    const batchThreshold = this._getIncrementalBatchThreshold(bucket && bucket.key);
+    if (!batchThreshold) return;
     const queuedCount = (job.items || []).filter((item) => item.bucket === bucket.key && normalizeItemStatus(item.status) === 'queued').length;
-    if (!queuedCount) return;
+    if (queuedCount < batchThreshold) return;
     await this.store.saveItems(job.run.id, job.items);
     this._setRunDiagnostic(job, {
       phase: 'downloading_batch',
       bucket: bucket.key,
-      reason: 'Starting downloads for ' + queuedCount + ' newly found ' + bucket.key + ' items.',
+      reason: 'Starting downloads for batch ' + Math.max(1, Math.ceil(queuedCount / batchThreshold)) + ' of ' + bucket.key + ' after ' + queuedCount + ' queued items reached the ' + batchThreshold + ' item threshold.',
     });
     job.run.status = 'running';
-    job.run.summary_text = 'Downloading ' + queuedCount + ' newly found ' + bucket.key + ' videos…';
+    job.run.summary_text = 'Downloading batch of ' + queuedCount + ' ' + bucket.key + ' videos…';
     job.run.updated_at = Date.now();
     await this._downloadQueuedItems(job);
     if (job.cancelRequested || job.draftPublishLimitReached) return;
@@ -3355,19 +3763,20 @@ class BackupService extends EventEmitter {
     const draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(scoped.draftSharedLinkCatalogVersion) || 0));
     if (
       scoped.savedCatalogHydrated === true &&
+      Math.max(0, Math.floor(Number(scoped.savedCatalogVersion) || 0)) >= SAVED_CATALOG_VERSION &&
       force !== true &&
       hasHydratedDraftSharedLinks &&
       draftSharedLinkCatalogVersion >= DRAFT_SHARED_LINK_CATALOG_VERSION
     ) {
       if (targetAccountKey === this._getActiveAccountKey()) {
-        this.state.savedCatalog = normalizeBackupBucketCatalog(scoped.savedCatalog || createEmptyBackupBucketCatalog());
+        this.state.savedCatalog = normalizeSavedBackupCatalog(scoped.savedCatalog || createEmptySavedBackupCatalog());
         this.state.draftSharedLinkCatalog = existingDraftSharedLinkCatalog;
         this.state.draftSharedLinkCatalogVersion = draftSharedLinkCatalogVersion;
       }
       return;
     }
     const runIds = await this.store.listRunIds();
-    let nextCatalog = createEmptyBackupBucketCatalog();
+    let nextCatalog = createEmptySavedBackupCatalog();
     let nextDraftSharedLinkCatalog = createEmptyDraftSharedLinkCatalog();
     const resetCatalog = targetAccountKey === this._getActiveAccountKey()
       ? normalizeCacheResetCatalog(this.state.cacheResetCatalog)
@@ -3384,7 +3793,7 @@ class BackupService extends EventEmitter {
         return this._shouldKeepSavedItemAfterCacheReset(run, item, resetCatalog);
       });
       if (doneItems.length) {
-        nextCatalog = recordBackupItemsInBucketCatalog(nextCatalog, run, doneItems);
+        nextCatalog = recordSavedBackupItemsInCatalog(nextCatalog, run, doneItems);
       }
       for (let itemIndex = 0; itemIndex < allDoneItems.length; itemIndex += 1) {
         const item = allDoneItems[itemIndex];
@@ -3415,16 +3824,19 @@ class BackupService extends EventEmitter {
     scoped.savedCatalog = nextCatalog;
     scoped.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(nextDraftSharedLinkCatalog);
     scoped.draftSharedLinkCatalogVersion = DRAFT_SHARED_LINK_CATALOG_VERSION;
+    scoped.savedCatalogVersion = SAVED_CATALOG_VERSION;
     scoped.savedCatalogHydrated = true;
     if (targetAccountKey === this._getActiveAccountKey()) {
-      this.state.savedCatalog = normalizeBackupBucketCatalog(nextCatalog);
+      this.state.savedCatalog = normalizeSavedBackupCatalog(nextCatalog);
       this.state.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(nextDraftSharedLinkCatalog);
       this.state.draftSharedLinkCatalogVersion = DRAFT_SHARED_LINK_CATALOG_VERSION;
+      this.state.savedCatalogVersion = SAVED_CATALOG_VERSION;
+      this.state.savedCatalogHydrated = true;
     }
   }
 
   _buildClearCacheTargets() {
-    const modeTargets = CLEARABLE_CACHE_BUCKETS.map((key) => ({
+    const modeTargets = CLEARABLE_CACHE_MODE_KEYS.map((key) => ({
       key: key,
       label: CLEARABLE_CACHE_LABELS[key] || key,
     }));
@@ -3440,27 +3852,47 @@ class BackupService extends EventEmitter {
 
   _collectHistoricalCharacterHandles() {
     const bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
-    const savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    const savedCatalog = normalizeSavedBackupCatalog(this.state.savedCatalog || createEmptySavedBackupCatalog());
     const resetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
-    const bucketHandles = new Set();
-    const savedHandles = new Set();
+    const bucketPostHandles = new Set();
+    const bucketDraftHandles = new Set();
+    const savedPostHandles = new Set();
+    const savedDraftHandles = new Set();
     const handles = new Set();
     Object.keys(bucketCatalog.characterPosts || {}).forEach((handle) => {
       const normalizedHandle = normalizeCharacterHandle(handle);
       if (!normalizedHandle) return;
       handles.add(normalizedHandle);
-      bucketHandles.add(normalizedHandle);
+      bucketPostHandles.add(normalizedHandle);
+    });
+    Object.keys(bucketCatalog.characterDrafts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      handles.add(normalizedHandle);
+      bucketDraftHandles.add(normalizedHandle);
     });
     Object.keys(savedCatalog.characterPosts || {}).forEach((handle) => {
       const normalizedHandle = normalizeCharacterHandle(handle);
       if (!normalizedHandle) return;
       handles.add(normalizedHandle);
-      savedHandles.add(normalizedHandle);
+      savedPostHandles.add(normalizedHandle);
+    });
+    Object.keys(savedCatalog.characterDrafts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      handles.add(normalizedHandle);
+      savedDraftHandles.add(normalizedHandle);
     });
     Object.keys(resetCatalog.characterPosts || {}).forEach((handle) => {
       const normalizedHandle = normalizeCharacterHandle(handle);
       if (!normalizedHandle) return;
-      if (!bucketHandles.has(normalizedHandle) && !savedHandles.has(normalizedHandle)) return;
+      if (!bucketPostHandles.has(normalizedHandle) && !savedPostHandles.has(normalizedHandle)) return;
+      if (!handles.has(normalizedHandle)) handles.add(normalizedHandle);
+    });
+    Object.keys(resetCatalog.characterDrafts || {}).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      if (!bucketDraftHandles.has(normalizedHandle) && !savedDraftHandles.has(normalizedHandle)) return;
       if (!handles.has(normalizedHandle)) handles.add(normalizedHandle);
     });
     return Array.from(handles).sort((left, right) => left.localeCompare(right));
@@ -3483,7 +3915,11 @@ class BackupService extends EventEmitter {
       const handle = normalizeCharacterHandle(run && run.settings && run.settings.character_handle);
       return handle ? normalizeCacheResetTimestamp(resetCatalog && resetCatalog.characterPosts && resetCatalog.characterPosts[handle]) : 0;
     }
-    if (CLEARABLE_CACHE_BUCKETS.indexOf(bucketKey) >= 0) {
+    if (bucketKey === 'characterDrafts') {
+      const handle = normalizeCharacterHandle(run && run.settings && run.settings.character_drafts_handle);
+      return handle ? normalizeCacheResetTimestamp(resetCatalog && resetCatalog.characterDrafts && resetCatalog.characterDrafts[handle]) : 0;
+    }
+    if (CLEARABLE_CACHE_BUCKET_KEYS.indexOf(bucketKey) >= 0) {
       return normalizeCacheResetTimestamp(resetCatalog && resetCatalog[bucketKey]);
     }
     return 0;
@@ -3522,122 +3958,133 @@ class BackupService extends EventEmitter {
   }
 
   async scanPostStats(progressCallback) {
-    await this.session.ensureAuthHeaders();
-    const allPosts = [];
-    let cursor = null;
-    let page = 0;
-    const seenCursors = new Set();
-    const emitProgress = typeof progressCallback === 'function' ? progressCallback : () => {};
+    return this._runCancelableForegroundOperation('post_stats_scan', async (operation) => {
+      await this.session.ensureAuthHeaders();
+      this._throwIfForegroundOperationCancelled(operation);
+      const allPosts = [];
+      let cursor = null;
+      let page = 0;
+      const seenCursors = new Set();
+      const emitProgress = typeof progressCallback === 'function' ? progressCallback : () => {};
 
-    do {
-      page += 1;
-      let pageJson = null;
-      let fetchSucceeded = false;
+      do {
+        this._throwIfForegroundOperationCancelled(operation);
+        page += 1;
+        let pageJson = null;
+        let fetchSucceeded = false;
 
-      for (let attempt = 1; attempt <= SCAN_PROGRESS_STALL_MAX_ATTEMPTS; attempt += 1) {
-        let timeoutId = null;
-        let timedOut = false;
-        try {
-          await Promise.race([
-            (async () => {
-              const params = { limit: 50, cut: 'nf2' };
-              if (cursor) params.cursor = cursor;
-              const response = await this.session.fetchJson('/backend/project_y/profile_feed/me', params, {
-                signal: this._createActiveAbortSignal(),
-              });
-              pageJson = response.json || {};
-              fetchSucceeded = true;
-            })(),
-            new Promise((_, reject) => {
-              timeoutId = setTimeout(() => {
-                timedOut = true;
-                this._abortActiveWork();
-                reject(new Error('post_stats_scan_stalled'));
-              }, SCAN_PROGRESS_STALL_TIMEOUT_MS);
-            }),
-          ]);
-          break;
-        } catch (error) {
-          if (timedOut && attempt >= SCAN_PROGRESS_STALL_MAX_ATTEMPTS) {
-            throw new Error('Post stats scan stalled on page ' + page + ' after ' + SCAN_PROGRESS_STALL_MAX_ATTEMPTS + ' attempts.');
+        for (let attempt = 1; attempt <= SCAN_PROGRESS_STALL_MAX_ATTEMPTS; attempt += 1) {
+          let timeoutId = null;
+          let timedOut = false;
+          try {
+            await Promise.race([
+              (async () => {
+                const params = { limit: 50, cut: 'nf2' };
+                if (cursor) params.cursor = cursor;
+                const response = await this.session.fetchJson('/backend/project_y/profile_feed/me', params, {
+                  signal: this._createActiveAbortSignal(),
+                });
+                pageJson = response.json || {};
+                fetchSucceeded = true;
+              })(),
+              new Promise((_, reject) => {
+                timeoutId = setTimeout(() => {
+                  timedOut = true;
+                  this._abortActiveWork();
+                  reject(new Error('post_stats_scan_stalled'));
+                }, SCAN_PROGRESS_STALL_TIMEOUT_MS);
+              }),
+            ]);
+            break;
+          } catch (error) {
+            this._throwIfForegroundOperationCancelled(operation);
+            if (timedOut && attempt >= SCAN_PROGRESS_STALL_MAX_ATTEMPTS) {
+              throw new Error('Post stats scan stalled on page ' + page + ' after ' + SCAN_PROGRESS_STALL_MAX_ATTEMPTS + ' attempts.');
+            }
+            if (!timedOut) {
+              throw error;
+            }
+            emitProgress({
+              page,
+              count: allPosts.length,
+              done: false,
+              retrying: true,
+              attempt: attempt + 1,
+              maxAttempts: SCAN_PROGRESS_STALL_MAX_ATTEMPTS,
+            });
+            await this._waitForDelay(SCAN_PROGRESS_STALL_RETRY_DELAY_MS);
+          } finally {
+            if (timeoutId) clearTimeout(timeoutId);
           }
-          if (!timedOut) {
-            throw error;
-          }
-          emitProgress({
-            page,
-            count: allPosts.length,
-            done: false,
-            retrying: true,
-            attempt: attempt + 1,
-            maxAttempts: SCAN_PROGRESS_STALL_MAX_ATTEMPTS,
+        }
+
+        this._throwIfForegroundOperationCancelled(operation);
+        if (!fetchSucceeded || !pageJson) break;
+
+        const items = extractItemsFromPayload(pageJson);
+        if (!items.length) break;
+        for (let i = 0; i < items.length; i += 1) {
+          const entry = items[i];
+          const post = entry && entry.post ? entry.post : entry;
+          if (!post || !post.is_owner) continue;
+          const attachment = post.attachments && post.attachments.length ? post.attachments[0] : {};
+          const thumbnailEncoding = attachment.encodings && attachment.encodings.thumbnail;
+          allPosts.push({
+            post_id: post.id || '',
+            timestamp: post.posted_at || 0,
+            caption: post.text || post.caption || '',
+            permalink: post.permalink || '',
+            view_count: post.view_count || 0,
+            unique_view_count: post.unique_view_count || 0,
+            like_count: post.like_count || 0,
+            reply_count: post.reply_count || 0,
+            recursive_reply_count: post.recursive_reply_count || 0,
+            share_count: post.share_count || 0,
+            repost_count: post.repost_count || 0,
+            remix_count: post.remix_count || 0,
+            duration_s: attachment.duration_s || 0,
+            width: attachment.width || 0,
+            height: attachment.height || 0,
+            thumbnail_url: (thumbnailEncoding && thumbnailEncoding.path) || '',
           });
-          await this._waitForDelay(SCAN_PROGRESS_STALL_RETRY_DELAY_MS);
-        } finally {
-          if (timeoutId) clearTimeout(timeoutId);
         }
-      }
 
-      if (!fetchSucceeded || !pageJson) break;
-
-      const items = extractItemsFromPayload(pageJson);
-      if (!items.length) break;
-      for (let i = 0; i < items.length; i += 1) {
-        const entry = items[i];
-        const post = entry && entry.post ? entry.post : entry;
-        if (!post || !post.is_owner) continue;
-        const attachment = post.attachments && post.attachments.length ? post.attachments[0] : {};
-        const thumbnailEncoding = attachment.encodings && attachment.encodings.thumbnail;
-        allPosts.push({
-          post_id: post.id || '',
-          timestamp: post.posted_at || 0,
-          caption: post.text || post.caption || '',
-          permalink: post.permalink || '',
-          view_count: post.view_count || 0,
-          unique_view_count: post.unique_view_count || 0,
-          like_count: post.like_count || 0,
-          reply_count: post.reply_count || 0,
-          recursive_reply_count: post.recursive_reply_count || 0,
-          share_count: post.share_count || 0,
-          repost_count: post.repost_count || 0,
-          remix_count: post.remix_count || 0,
-          duration_s: attachment.duration_s || 0,
-          width: attachment.width || 0,
-          height: attachment.height || 0,
-          thumbnail_url: (thumbnailEncoding && thumbnailEncoding.path) || '',
-        });
-      }
-
-      const nextCursor = extractCursorFromPayload(pageJson);
-      if (nextCursor && !seenCursors.has(nextCursor)) {
-        seenCursors.add(nextCursor);
-        cursor = nextCursor;
-      } else {
-        cursor = null;
-      }
-
-      emitProgress({ page, count: allPosts.length, done: !cursor });
-    } while (cursor);
-
-    let savedPath = null;
-    if (allPosts.length > 0) {
-      try {
-        const downloadDir = (this.state.settings && this.state.settings.downloadDir) || '';
-        if (downloadDir) {
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
-          const filePath = path.join(downloadDir, 'Post Stats', 'post-stats-' + stamp + '.csv');
-          const csvContent = this._buildPostStatsCsv(allPosts);
-          const saved = await this.store.writeFile(filePath, csvContent);
-          savedPath = saved.path;
+        const nextCursor = extractCursorFromPayload(pageJson);
+        if (nextCursor && !seenCursors.has(nextCursor)) {
+          seenCursors.add(nextCursor);
+          cursor = nextCursor;
+        } else {
+          cursor = null;
         }
-      } catch (_saveErr) {}
-    }
 
-    return { posts: allPosts, savedPath };
+        emitProgress({ page, count: allPosts.length, done: !cursor });
+      } while (cursor);
+
+      this._throwIfForegroundOperationCancelled(operation);
+      let savedPath = null;
+      if (allPosts.length > 0) {
+        try {
+          const downloadDir = (this.state.settings && this.state.settings.downloadDir) || this.defaultDownloadDir || '';
+          if (downloadDir) {
+            const sessionUserHandle = normalizeCharacterHandle(this.state && this.state.session && this.state.session.user && this.state.session.user.handle);
+            const filename = sessionUserHandle
+              ? ('@' + sessionUserHandle.replace(/^@+/, '') + ' post stats.csv')
+              : 'my post stats.csv';
+            const filePath = path.join(downloadDir, 'Stats', filename);
+            const csvContent = this._buildPostStatsCsv(allPosts);
+            const saved = await this.store.writeFile(filePath, csvContent);
+            savedPath = saved.path;
+          }
+        } catch (_saveErr) {}
+      }
+
+      this._throwIfForegroundOperationCancelled(operation);
+      return { posts: allPosts, savedPath };
+    });
   }
 
   _buildPostStatsCsv(posts) {
-    const headers = ['Post ID', 'Post Date', 'Caption', 'Post URL', 'Total Views', 'Unique Views', 'Likes', 'Replies', 'Total Replies', 'Shares', 'Reposts', 'Remixes', 'Video Duration (s)', 'Video Width', 'Video Height', 'Thumbnail URL'];
+    const headers = ['Video', 'Post Date', 'Caption', 'Post URL', 'Total Views', 'Unique Views', 'Likes', 'Replies', 'Total Replies', 'Shares', 'Reposts', 'Remixes', 'Video Duration (s)', 'Video Width', 'Video Height', 'Thumbnail URL'];
     const rows = [headers.join(',')];
     for (let i = 0; i < posts.length; i += 1) {
       const p = posts[i];
@@ -3665,15 +4112,45 @@ class BackupService extends EventEmitter {
   }
 
   async fetchCharacterStats(handle) {
-    await this.session.ensureAuthHeaders();
-    const cleanHandle = String(handle || '').replace(/^@/, '').trim();
-    if (!cleanHandle) throw new Error('No character handle provided.');
-    const profile = await this.session.fetchJson(
-      '/backend/project_y/profile/username/' + encodeURIComponent(cleanHandle),
-      {},
-      { maxAttempts: 2 }
-    );
-    return profile;
+    return this._runCancelableForegroundOperation('character_stats_fetch', async (operation) => {
+      await this.session.ensureAuthHeaders();
+      this._throwIfForegroundOperationCancelled(operation);
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) throw new Error('No character handle provided.');
+      const response = await this.session.fetchJson(
+        '/backend/project_y/profile/username/' + encodeURIComponent(normalizedHandle),
+        {},
+        { maxAttempts: 2, signal: this._createActiveAbortSignal() }
+      );
+      this._throwIfForegroundOperationCancelled(operation);
+      const profile = response && response.json && typeof response.json === 'object' ? response.json : {};
+      const downloadDir = (this.state.settings && this.state.settings.downloadDir) || this.defaultDownloadDir || '';
+      if (!downloadDir) throw new Error('No download folder configured.');
+      const filePath = path.join(downloadDir, 'Stats', '@' + normalizedHandle.replace(/^@+/, '') + ' stats.csv');
+      const saved = await this.store.writeFile(filePath, this._buildCharacterStatsCsv(profile));
+      this._throwIfForegroundOperationCancelled(operation);
+      return { profile, savedPath: saved.path };
+    });
+  }
+
+  _buildCharacterStatsCsv(profile) {
+    const source = profile && typeof profile === 'object' ? profile : {};
+    const formatTs = (ts) => ts ? new Date(Number(ts) * 1000).toISOString() : '';
+    const fields = [
+      ['Username', source.username],
+      ['Display Name', source.display_name],
+      ['Likes Received', source.likes_received_count],
+      ['Posts', source.cameo_count],
+      ['Created At', formatTs(source.created_at)],
+    ].filter(([, value]) => value !== null && value !== undefined && value !== '');
+    const headers = fields.map(([key]) => key).join(',');
+    const values = fields.map(([, value]) => {
+      const stringValue = String(value);
+      return stringValue.includes(',') || stringValue.includes('"') || stringValue.includes('\n')
+        ? '"' + stringValue.replace(/"/g, '""') + '"'
+        : stringValue;
+    }).join(',');
+    return headers + '\n' + values + '\n';
   }
 }
 

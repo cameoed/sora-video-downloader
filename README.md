@@ -13,7 +13,7 @@ Desktop app for saving your Sora videos and draft prompts! [**Get the app here!*
 - AI label controls:
   `No AI Label` or `With AI Label`
 - Crop controls:
-  `Default Crop` or `16:9 for Social`
+  `Default Crop` or `Cropped for Social Media`
 - Progress UI with page-aware scan updates
 - `Open folder` shortcut after a run
 - `Clear cache` for remembered download history
@@ -84,7 +84,7 @@ Windows:
 
 - `Crop`
   `Default Crop` keeps the source framing.
-  `16:9 for Social` exports social-ready framing.
+  `Cropped for Social Media` exports social-ready framing.
 
 - `Download folder`
   Chooses the download folder where exports and prompt CSVs are written.

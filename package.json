@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "private": true,
   "description": "Desktop Sora Video Downloader for macOS and Windows using Electron.",
+  "author": "topher",
   "main": "desktop/main.js",
   "scripts": {
     "prepare:icons": "node desktop/scripts/prepare-icons.js",
@@ -30,6 +31,12 @@
     ],
     "files": [
       "desktop/**/*",
+      "music/**/*",
+      "icons/topher.webp",
+      "!desktop/scripts/__pycache__{,/**/*}",
+      "!desktop/scripts/prepare-ffmpeg.js",
+      "!desktop/scripts/prepare-icons.js",
+      "!desktop/scripts/prepare-release.js",
       "!desktop/build-resources/ffmpeg{,/**/*}",
       "uv-backup-logic.js",
       "README.md",

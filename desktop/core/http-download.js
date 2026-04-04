@@ -11,6 +11,18 @@ const KONTEN_SMART_DOWNLOAD_HEADERS = {
   referer: 'https://kontenai.net/',
   'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
 };
+const SORAVDL_LEGACY_SMART_DOWNLOAD_HEADERS = {
+  accept: 'video/mp4,video/*;q=0.9,*/*;q=0.8',
+  origin: 'https://jsonpromptgenerator.net',
+  referer: 'https://jsonpromptgenerator.net/bulk-sora-video-downloader',
+};
+const SORAVDL_SITE_SMART_DOWNLOAD_HEADERS = {
+  accept: '*/*',
+  'accept-language': 'en-US,en;q=0.9',
+  origin: 'https://soravdl.com',
+  referer: 'https://soravdl.com/',
+  'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
+};
 const DEFAULT_DOWNLOAD_HEADERS = {
   'user-agent': 'Sora Video Downloader',
 };
@@ -52,6 +64,30 @@ const SMART_DOWNLOAD_PROVIDERS = [
       return {
         url: String(downloadUrl),
         headers: {},
+        requireVideoContentType: true,
+      };
+    },
+  },
+  {
+    id: 'sorvdl',
+    async resolve(item) {
+      const postId = String(item && (item.id || item.post_id) || '').trim() || extractIdFromPermalink(item && item.post_permalink);
+      if (!postId) throw new Error('smart_download_missing_post_id');
+      return {
+        url: 'https://soravdl.com/api/proxy/video/' + encodeURIComponent(postId),
+        headers: SORAVDL_LEGACY_SMART_DOWNLOAD_HEADERS,
+        acceptVideoOnErrorStatus: true,
+      };
+    },
+  },
+  {
+    id: 'sorvdl_site',
+    async resolve(item) {
+      const postId = String(item && (item.id || item.post_id) || '').trim() || extractIdFromPermalink(item && item.post_permalink);
+      if (!postId) throw new Error('smart_download_missing_post_id');
+      return {
+        url: 'https://soravdl.com/api/proxy/video/' + encodeURIComponent(postId),
+        headers: SORAVDL_SITE_SMART_DOWNLOAD_HEADERS,
         requireVideoContentType: true,
       };
     },

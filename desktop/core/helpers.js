@@ -521,7 +521,7 @@ function buildBackupFolderName(run, bucket) {
   if (bucket === 'ownPrompts') return accountPrefix + 'Sora Prompts';
   const watermarkLabel = settings.published_download_mode === 'direct_sora' ? 'With Watermark' : 'No Watermark';
   const audiomarkLabel = settings.audio_mode === 'with_audiomark' ? 'With Label' : 'No Label';
-  const framingLabel = settings.framing_mode === 'social_16_9' ? '16:9 for Social' : 'Default Crop';
+  const framingLabel = settings.framing_mode === 'social_16_9' ? 'Cropped for Social Media' : 'Default Crop';
   let folderPrefix = accountPrefix + bucket;
   if (bucket === 'ownPosts') folderPrefix = accountPrefix + 'Sora Posts';
   else if (bucket === 'ownDrafts') folderPrefix = accountPrefix + 'Sora Drafts';
@@ -873,6 +873,7 @@ function createEmptyBackupBucketProgressSnapshot() {
       castInDrafts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
       characterPosts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
       ownPrompts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
+      characterDrafts: { completed: 0, total: 0, scanned_count: 0, has_scan_data: false },
     },
   };
 }

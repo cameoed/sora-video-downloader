@@ -4,11 +4,15 @@
   const CLEARABLE_MODE_TARGETS = [
     { key: 'ownPosts', label: 'My posts' },
     { key: 'ownDrafts', label: 'My drafts' },
+    { key: 'ownPrompts', label: 'My draft prompts' },
     { key: 'castInPosts', label: 'Cast-in posts' },
     { key: 'castInDrafts', label: 'Drafts of me' },
+    { key: 'postStats', label: 'My post stats' },
   ];
   const DEFAULT_PUBLISHED_DOWNLOAD_MODE = 'smart';
   const SMART_DOWNLOAD_OVERLOADED_MESSAGE = "All watermark removers are overloaded right now. Retrying every 3 mins until one comes online!";
+  const PROCESSING_HEADER_DELAY_MS = 2000;
+  const MUSIC_TRACK_PATH = '../../music/Digital Insanity by Kenet & Rez.m4a';
   function normalizePublishedDownloadMode(value) {
     return value === 'direct_sora' ? 'direct_sora' : DEFAULT_PUBLISHED_DOWNLOAD_MODE;
   }
@@ -40,6 +44,7 @@
     loginFlowPromise: null,
     awaitingLoginCompletion: false,
     lastSessionRefreshAt: 0,
+    manualBearerConnected: false,
     headerNotice: '',
     cancelPending: false,
     clearCacheTargets: null,
@@ -52,25 +57,36 @@
     logoutStatus: '',
     manualBearerModalOpen: false,
     manualBearerSubmitting: false,
+    manualBearerAttemptSeq: 0,
+    manualBearerVisibleRequestId: 0,
     manualBearerStatus: '',
     draftCookieModalOpen: false,
     draftCookieSubmitting: false,
     draftCookieStatus: '',
     pendingDraftCookieBackupRequest: null,
     workingDots: '',
+    processingHeaderDelayRunId: '',
+    processingHeaderDelayUntil: 0,
+    processingHeaderDelayLabel: '',
+    smartDownloadRetryRunId: '',
     openRunFolderHighlighted: false,
     openRunFolderTrackedRunId: '',
     openRunFolderAcknowledgedDoneCount: 0,
     postStatsScanning: false,
     postStatsPage: 0,
     postStatsProgressCount: 0,
+    postStatsRetrying: false,
+    postStatsRetryAttempt: 0,
+    postStatsRetryMaxAttempts: 0,
     postStatsData: [],
     characterStatsFetching: false,
+    musicPlaying: false,
   };
 
   const ui = {
     openLoginBtn: document.getElementById('openLoginBtn'),
     manualBearerBtn: document.getElementById('manualBearerBtn'),
+    musicToggleBtn: document.getElementById('musicToggleBtn'),
     heroSubtitle: document.getElementById('heroSubtitle'),
     heroDetail: document.getElementById('heroDetail'),
     progressBadge: document.getElementById('progressBadge'),
@@ -82,6 +98,7 @@
     framingModeSelect: document.getElementById('framingModeSelect'),
     characterHandle: document.getElementById('characterHandle'),
     characterScopeName: document.getElementById('characterScopeName'),
+    startBackupTooltip: document.getElementById('startBackupTooltip'),
     startBackupBtn: document.getElementById('startBackupBtn'),
     cancelBackupBtn: document.getElementById('cancelBackupBtn'),
     openRunFolderBtn: document.getElementById('openRunFolderBtn'),
@@ -96,6 +113,7 @@
     clearCacheBackdrop: document.getElementById('clearCacheBackdrop'),
     clearCacheLoading: document.getElementById('clearCacheLoading'),
     clearCacheContent: document.getElementById('clearCacheContent'),
+    clearCacheToggleBtn: document.getElementById('clearCacheToggleBtn'),
     clearCacheModesList: document.getElementById('clearCacheModesList'),
     clearCacheCharactersSection: document.getElementById('clearCacheCharactersSection'),
     clearCacheCharactersList: document.getElementById('clearCacheCharactersList'),
@@ -139,10 +157,38 @@
   let resizeFrame = 0;
   let lastSentHeight = 0;
   let workingDotsTimer = 0;
+  let processingHeaderDelayTimer = 0;
+  let musicAudio = null;
 
   function setText(element, value) {
     if (!element) return;
     element.textContent = value;
+  }
+
+  function ensureMusicAudio() {
+    if (musicAudio) return musicAudio;
+    musicAudio = new Audio(new URL(MUSIC_TRACK_PATH, window.location.href).toString());
+    musicAudio.loop = true;
+    musicAudio.preload = 'auto';
+    musicAudio.addEventListener('error', () => {
+      state.musicPlaying = false;
+      renderMusicToggle();
+    });
+    return musicAudio;
+  }
+
+  function stopMusicPlayback() {
+    if (!musicAudio) return;
+    musicAudio.pause();
+    musicAudio.currentTime = 0;
+  }
+
+  function renderMusicToggle() {
+    if (!ui.musicToggleBtn) return;
+    ui.musicToggleBtn.dataset.tone = state.musicPlaying ? 'ok' : 'idle';
+    ui.musicToggleBtn.setAttribute('aria-pressed', state.musicPlaying ? 'true' : 'false');
+    ui.musicToggleBtn.setAttribute('aria-label', state.musicPlaying ? 'Stop music loop' : 'Play music on loop');
+    ui.musicToggleBtn.title = state.musicPlaying ? 'Stop music' : 'Play music';
   }
 
   function formatCount(value) {
@@ -184,8 +230,88 @@
   }
 
   function setRun(nextRun, options) {
+    const previousRun = state.run;
     state.run = nextRun || null;
+    syncSmartDownloadRetryState(previousRun, state.run);
+    syncProcessingHeaderDelay(previousRun, state.run);
     syncOpenRunFolderAttention(state.run, options);
+  }
+
+  function syncSmartDownloadRetryState(previousRun, nextRun) {
+    const previousRunId = getRunId(previousRun);
+    const nextRunId = getRunId(nextRun);
+    if (!nextRunId) {
+      state.smartDownloadRetryRunId = '';
+      return;
+    }
+    if (previousRunId && previousRunId !== nextRunId) {
+      state.smartDownloadRetryRunId = '';
+    }
+    if (
+      nextRun &&
+      (
+        isSmartDownloadOverloadedMessage(nextRun.summary_text) ||
+        isSmartDownloadOverloadedMessage(nextRun.last_error)
+      )
+    ) {
+      state.smartDownloadRetryRunId = nextRunId;
+    }
+  }
+
+  function clearProcessingHeaderDelay() {
+    state.processingHeaderDelayRunId = '';
+    state.processingHeaderDelayUntil = 0;
+    state.processingHeaderDelayLabel = '';
+    if (processingHeaderDelayTimer) {
+      window.clearTimeout(processingHeaderDelayTimer);
+      processingHeaderDelayTimer = 0;
+    }
+  }
+
+  function scheduleProcessingHeaderDelayRender() {
+    if (processingHeaderDelayTimer) {
+      window.clearTimeout(processingHeaderDelayTimer);
+      processingHeaderDelayTimer = 0;
+    }
+    const remainingMs = Math.max(0, state.processingHeaderDelayUntil - Date.now());
+    if (!remainingMs) {
+      clearProcessingHeaderDelay();
+      return;
+    }
+    processingHeaderDelayTimer = window.setTimeout(() => {
+      processingHeaderDelayTimer = 0;
+      if (Date.now() >= state.processingHeaderDelayUntil) {
+        clearProcessingHeaderDelay();
+        renderHeader();
+      }
+    }, remainingMs);
+  }
+
+  function syncProcessingHeaderDelay(previousRun, nextRun) {
+    const previousRunId = getRunId(previousRun);
+    const nextRunId = getRunId(nextRun);
+    if (
+      previousRun &&
+      nextRun &&
+      previousRunId &&
+      previousRunId === nextRunId &&
+      previousRun.status === 'discovering' &&
+      nextRun.status === 'running' &&
+      /^Discovery complete\./i.test(String(nextRun.summary_text || '').trim())
+    ) {
+      state.processingHeaderDelayRunId = nextRunId;
+      state.processingHeaderDelayUntil = Date.now() + PROCESSING_HEADER_DELAY_MS;
+      state.processingHeaderDelayLabel = getRunDiscoveryLabel(previousRun);
+      scheduleProcessingHeaderDelayRender();
+      return;
+    }
+    if (!nextRun || nextRun.status !== 'running' || nextRunId !== state.processingHeaderDelayRunId) {
+      clearProcessingHeaderDelay();
+      return;
+    }
+    if (Date.now() >= state.processingHeaderDelayUntil) {
+      clearProcessingHeaderDelay();
+    }
   }
 
   function acknowledgeOpenRunFolderAttention() {
@@ -249,16 +375,29 @@
     }).format(timestamp);
   }
 
-  function isDraftWatermarkFreeBlocked() {
+  function isDraftWatermarkFreeBlocked(scopeKey) {
+    const targetScope = String(scopeKey || getSelectedScope() || '').trim();
     const usage = normalizeDraftPublishUsage(state.draftPublishUsage);
-    return isDraftScope(getSelectedScope()) &&
+    return isDraftScope(targetScope) &&
       normalizePublishedDownloadMode(state.settings.published_download_mode) === 'smart' &&
       usage.count >= usage.limit;
   }
 
-  function getDraftWatermarkFreeBlockedNotice() {
-    if (!isDraftWatermarkFreeBlocked()) return '';
+  function getDraftWatermarkFreeBlockedNotice(scopeKey) {
+    if (!isDraftWatermarkFreeBlocked(scopeKey)) return '';
     return 'Come back tomorrow at ' + formatDraftPublishResetTimestamp(state.draftPublishUsage) + ' to keep downloading drafts watermark-free! Sora only allows 500 per day.';
+  }
+
+  function getDraftWatermarkModeDisabledReason(scopeKey) {
+    const publishedDownloadMode = normalizePublishedDownloadMode(ui.modeSelect ? ui.modeSelect.value : state.settings.published_download_mode);
+    if (publishedDownloadMode !== 'smart') return '';
+    if (scopeKey === 'castInDrafts') {
+      return "Unfortunately, there's no way to download other people's Drafts of Me without watermark.";
+    }
+    if (scopeKey === 'characterDrafts') {
+      return "Unfortunately, there's no way to download other people's drafts of a character without watermark.";
+    }
+    return '';
   }
 
   function formatClearCacheError(error) {
@@ -289,8 +428,16 @@
     return normalized || 'Could not save that draft auth.';
   }
 
+  function syncManualBearerPresence() {
+    if (state.manualBearerConnected) {
+      state.settings.has_manual_bearer_token = true;
+      return true;
+    }
+    return !!state.settings.has_manual_bearer_token;
+  }
+
   function draftCookieModalNeedsBearer() {
-    return !state.settings.has_manual_bearer_token;
+    return !syncManualBearerPresence();
   }
 
   function getClearCacheTargets() {
@@ -318,6 +465,25 @@
   function hasSelectedClearCachePayload() {
     const payload = getSelectedClearCachePayload();
     return payload.modes.length > 0 || payload.characters.length > 0;
+  }
+
+  function getClearCacheOptionInputs() {
+    if (!ui.clearCacheModal) return [];
+    return Array.from(ui.clearCacheModal.querySelectorAll('input[data-clear-cache-type]'));
+  }
+
+  function areAllClearCacheOptionsSelected() {
+    const inputs = getClearCacheOptionInputs();
+    return inputs.length > 0 && inputs.every((input) => input.checked);
+  }
+
+  function syncClearCacheToggleButton() {
+    if (!ui.clearCacheToggleBtn) return;
+    const inputs = getClearCacheOptionInputs();
+    const hasOptions = inputs.length > 0;
+    ui.clearCacheToggleBtn.hidden = !hasOptions || state.clearCacheLoading;
+    ui.clearCacheToggleBtn.disabled = state.clearCacheSubmitting || !hasOptions;
+    ui.clearCacheToggleBtn.textContent = hasOptions && areAllClearCacheOptionsSelected() ? 'Deselect all' : 'Select all';
   }
 
   function createClearCacheOption(type, value, label) {
@@ -348,8 +514,71 @@
     if (target) target.checked = true;
   }
 
+  function getRunLockedScope(run) {
+    if (!run) return '';
+    const settingsScope = run && run.settings ? String(run.settings.selectedScope || '').trim() : '';
+    if (settingsScope) return settingsScope;
+    const scopes = run && run.scopes ? run.scopes : {};
+    const activeScope = Object.keys(scopes).find((key) => scopes[key] === true);
+    return activeScope || '';
+  }
+
+  function isScopeSelectionLocked() {
+    return isRunProcessing(state.run) || state.postStatsScanning || state.characterStatsFetching;
+  }
+
+  function getLockedScope() {
+    if (isRunProcessing(state.run)) return getRunLockedScope(state.run);
+    if (state.postStatsScanning || state.characterStatsFetching) {
+      return state.settings.selectedScope || getSelectedScope();
+    }
+    return '';
+  }
+
   function isPostStatsScope() {
     return getSelectedScope() === 'postStats';
+  }
+
+  function hasCancelableForegroundWork() {
+    return isRunProcessing(state.run) || state.postStatsScanning || state.characterStatsFetching;
+  }
+
+  function isCancelledOperationMessage(value) {
+    return String(value || '').trim().toLowerCase() === 'backup_cancelled';
+  }
+
+  function getCharacterStatsFetchLabel() {
+    return 'Fetching character stats...';
+  }
+
+  function getPostStatsScanLabel() {
+    const page = Math.max(0, Number(state.postStatsPage) || 0);
+    const count = Math.max(0, Number(state.postStatsProgressCount) || 0);
+    if (state.postStatsRetrying) {
+      const attempt = Math.max(2, Number(state.postStatsRetryAttempt) || 0);
+      const maxAttempts = Math.max(attempt, Number(state.postStatsRetryMaxAttempts) || 0);
+      return 'Scanning posts · page ' + Math.max(1, page) + ' · ' + formatCount(count) + ' found · retry ' + attempt + ' of ' + maxAttempts;
+    }
+    if (page > 0) {
+      return 'Scanning posts · page ' + page + ' · ' + formatCount(count) + ' found';
+    }
+    return 'Preparing post stats scan...';
+  }
+
+  function getPostStatsCancelledLabel() {
+    return 'Post stats scan stopped.';
+  }
+
+  function getCharacterStatsCancelledLabel() {
+    return 'Character stats scan stopped.';
+  }
+
+  function resetPostStatsScanProgress() {
+    state.postStatsPage = 0;
+    state.postStatsProgressCount = 0;
+    state.postStatsRetrying = false;
+    state.postStatsRetryAttempt = 0;
+    state.postStatsRetryMaxAttempts = 0;
   }
 
   function buildScopes() {
@@ -433,8 +662,18 @@
     const progress = state.bucketProgress && state.bucketProgress.buckets ? state.bucketProgress.buckets : {};
     const scopeKey = getSelectedScope();
     const entry = progress[scopeKey] || {};
-    const totalLabel = formatCount(entry.total);
-    const completedLabel = formatCount(entry.completed);
+    const runBucketCounts = state.run && state.run.bucket_counts ? state.run.bucket_counts : {};
+    const total = Math.max(
+      0,
+      Number(runBucketCounts[scopeKey]) || 0,
+      Number(entry.total) || 0
+    );
+    const completed = Math.min(
+      total,
+      Math.max(0, Number(entry.completed) || 0)
+    );
+    const totalLabel = formatCount(total);
+    const completedLabel = formatCount(completed);
     return completedLabel + ' of ' + getScopeCountLabel(scopeKey, totalLabel, state.settings) + ' processed';
   }
 
@@ -474,6 +713,26 @@
     return 'Scanning videos';
   }
 
+  function getRunActionLabel(run) {
+    if (run && run.status === 'discovering') return getRunDiscoveryLabel(run);
+    if (
+      run &&
+      run.status === 'running' &&
+      state.processingHeaderDelayRunId === getRunId(run) &&
+      Date.now() < state.processingHeaderDelayUntil
+    ) {
+      return state.processingHeaderDelayLabel || getRunDiscoveryLabel(run);
+    }
+    if (
+      run &&
+      run.status === 'running' &&
+      state.smartDownloadRetryRunId === getRunId(run)
+    ) {
+      return 'Trying again to process videos';
+    }
+    return 'Processing videos';
+  }
+
   function getCompletedRunLabel(run) {
     const summaryText = String(run && run.summary_text || '').trim();
     if (/^Stopped at the draft copy-link daily limit\./i.test(summaryText)) return summaryText;
@@ -492,6 +751,44 @@
     if (scopes.ownPrompts) return 'ownPrompts';
     if (scopes.characterDrafts) return 'characterDrafts';
     return '';
+  }
+
+  // Batch labels track the queue threshold that triggers a progress-bar loop, not API page size.
+  function getIncrementalBatchSizeForBucket(bucketKey) {
+    if (bucketKey === 'characterPosts' || bucketKey === 'characterDrafts') return 1000;
+    if (bucketKey === 'ownDrafts' || bucketKey === 'castInDrafts' || bucketKey === 'castInPosts') return 100;
+    return 0;
+  }
+
+  function getRunBatchLabel(run) {
+    const bucketKey = String(run && run.diagnostic && run.diagnostic.bucket || '').trim() || getRunBucketKey(run);
+    const batchSize = getIncrementalBatchSizeForBucket(bucketKey);
+    if (!batchSize) return '';
+    const progress = state.bucketProgress && state.bucketProgress.buckets ? state.bucketProgress.buckets : {};
+    const bucketProgress = progress && progress[bucketKey] ? progress[bucketKey] : null;
+    const completeCount = Math.max(
+      0,
+      Number(bucketProgress && bucketProgress.completed) || 0
+    );
+    const totalCount = Math.max(
+      completeCount,
+      Math.max(0, Number(bucketProgress && bucketProgress.total) || 0),
+      Math.max(0, Number(bucketProgress && bucketProgress.scanned_count) || 0)
+    );
+    if (!totalCount) return 'Batch 1';
+    const currentBatch = Math.max(1, Math.floor(completeCount / batchSize) + 1);
+    const maxBatch = Math.max(1, Math.ceil(totalCount / batchSize));
+    return 'Batch ' + Math.min(currentBatch, maxBatch);
+  }
+
+  function shouldShowOwnDraftsInitializingLabel(run) {
+    const bucketKey = String(run && run.diagnostic && run.diagnostic.bucket || '').trim() || getRunBucketKey(run);
+    if (bucketKey !== 'ownDrafts') return false;
+    if (!run || (run.status !== 'discovering' && run.status !== 'running')) return false;
+    const progress = state.bucketProgress && state.bucketProgress.buckets ? state.bucketProgress.buckets : {};
+    const bucketProgress = progress && progress.ownDrafts ? progress.ownDrafts : null;
+    const completed = Math.max(0, Number(bucketProgress && bucketProgress.completed) || 0);
+    return completed < 1;
   }
 
   function renderHeroDetail(text) {
@@ -588,20 +885,32 @@
     const authenticated = !!(state.session && state.session.authenticated);
     const runActive = isRunProcessing(run);
     const draftLimitNotice = getDraftWatermarkFreeBlockedNotice();
+    const specialScopeLabel = state.postStatsScanning
+      ? getPostStatsScanLabel()
+      : state.characterStatsFetching
+      ? getCharacterStatsFetchLabel()
+      : '';
     const overloadNotice = run && (
       isSmartDownloadOverloadedMessage(run.summary_text) ||
       isSmartDownloadOverloadedMessage(run.last_error)
     )
       ? String(run.summary_text || run.last_error || '')
       : '';
+    if (specialScopeLabel) {
+      renderHeroDetail('');
+      setText(ui.heroSubtitle, specialScopeLabel);
+      setText(ui.progressBadge, '0% complete');
+      ui.progressFill.style.width = '0%';
+      ui.progressFill.dataset.complete = 'false';
+      ui.openRunFolderBtn.disabled = false;
+      renderOpenRunFolderButton();
+      return;
+    }
     if (!run) {
       renderHeroDetail('');
-      const postStatsLabel = state.postStatsScanning
-        ? 'Scanning post stats · page ' + (state.postStatsPage || 1) + ' · ' + formatCount(state.postStatsProgressCount) + ' posts found...'
-        : '';
       setText(
         ui.heroSubtitle,
-        state.headerNotice || draftLimitNotice || postStatsLabel || state.sessionPrompt || (authenticated
+        state.headerNotice || draftLimitNotice || state.sessionPrompt || (authenticated
           ? 'Ready to go!'
           : state.authPollInFlight
           ? 'Checking Sora session…'
@@ -609,6 +918,7 @@
       );
       setText(ui.progressBadge, '0% complete');
       ui.progressFill.style.width = '0%';
+      ui.progressFill.dataset.complete = 'false';
       ui.openRunFolderBtn.disabled = false;
       renderOpenRunFolderButton();
       return;
@@ -619,6 +929,7 @@
       setText(ui.heroSubtitle, state.headerNotice || draftLimitNotice || overloadNotice || state.sessionPrompt || 'Sign in to get started');
       setText(ui.progressBadge, '0% complete');
       ui.progressFill.style.width = '0%';
+      ui.progressFill.dataset.complete = 'false';
       ui.openRunFolderBtn.disabled = false;
       renderOpenRunFolderButton();
       return;
@@ -626,7 +937,7 @@
 
     const totalLabel = formatCount(metrics.total);
     const completeLabel = formatCount(metrics.complete);
-    const actionLabel = run.status === 'discovering' ? getRunDiscoveryLabel(run) : 'Processing videos';
+    const actionLabel = getRunActionLabel(run);
     const stoppedLabel = getSelectedScopeProcessedLabel();
     const noResultsLabel = run.status === 'completed' && metrics.total === 0
       ? getNoResultsLabel(getSelectedScope(), state.settings)
@@ -635,13 +946,19 @@
       ? getCompletedRunLabel(run)
       : '';
     renderHeroDetail('');
+    const batchLabel = getRunBatchLabel(run);
+    const activeProgressLabel = run.status === 'cancelled'
+      ? stoppedLabel
+      : shouldShowOwnDraftsInitializingLabel(run)
+      ? 'Initializing... this may take up to 1 minute'
+      : (actionLabel + ' · ' + completeLabel + ' of ' + totalLabel + (batchLabel ? ' · ' + batchLabel : ''));
     setText(
       ui.heroSubtitle,
-      state.headerNotice || draftLimitNotice || overloadNotice || noResultsLabel || completedRunLabel || (run.status === 'cancelled' ? stoppedLabel : (actionLabel + ' · ' + completeLabel + ' of ' + totalLabel))
+      state.headerNotice || draftLimitNotice || overloadNotice || noResultsLabel || completedRunLabel || activeProgressLabel
     );
-    const pageNumber = getDiscoveryPageNumber(run);
-    setText(ui.progressBadge, pageNumber ? (metrics.percent + '% of page ' + pageNumber + ' complete') : (metrics.percent + '% complete'));
+    setText(ui.progressBadge, metrics.percent + '% complete');
     ui.progressFill.style.width = metrics.percent + '%';
+    ui.progressFill.dataset.complete = metrics.percent >= 100 ? 'true' : 'false';
     ui.openRunFolderBtn.disabled = false;
     renderOpenRunFolderButton();
   }
@@ -660,7 +977,8 @@
     };
     SCOPE_KEYS.forEach((key) => {
       if (key === 'postStats') {
-        setText(rowProgressMap[key], state.postStatsData.length ? formatCount(state.postStatsData.length) : '?');
+        const visibleCount = state.postStatsScanning ? state.postStatsProgressCount : state.postStatsData.length;
+        setText(rowProgressMap[key], state.postStatsScanning || visibleCount ? formatCount(visibleCount) : '?');
         return;
       }
       const entry = progress[key] || {};
@@ -675,7 +993,10 @@
   function renderControls() {
     const authenticated = !!(state.session && state.session.authenticated);
     const runActive = isRunProcessing(state.run);
-    const selectedScope = getSelectedScope();
+    const scopeSelectionLocked = isScopeSelectionLocked();
+    const lockedScope = getLockedScope();
+    if (lockedScope) setSelectedScope(lockedScope);
+    const selectedScope = lockedScope || getSelectedScope();
     const needsCharacter = selectedScope === 'characterPosts';
     const needsCharacterDrafts = selectedScope === 'characterDrafts';
     const needsCharacterStats = selectedScope === 'characterStats';
@@ -685,21 +1006,50 @@
     const hasCharacterDrafts = String(ui.characterDraftsHandle.value || '').trim().length > 0;
     const hasCharacterStats = String(ui.characterStatsHandle.value || '').trim().length > 0;
     const draftFlowBlocked = isDraftWatermarkFreeBlocked();
-    const specialScope = postStats || needsCharacterStats;
-    ui.startBackupBtn.disabled = (postStats ? state.postStatsScanning : needsCharacterStats ? state.characterStatsFetching : runActive) || draftFlowBlocked || (needsCharacter && !hasCharacter) || (needsCharacterDrafts && !hasCharacterDrafts) || (needsCharacterStats && !hasCharacterStats);
+    const draftWatermarkModeDisabledReason = getDraftWatermarkModeDisabledReason(selectedScope);
+    const specialScopeBusy = state.postStatsScanning || state.characterStatsFetching;
+    const stopActive = runActive || specialScopeBusy;
+    const cancelPending = state.cancelPending && stopActive;
+    ui.startBackupBtn.disabled = stopActive || draftFlowBlocked || !!draftWatermarkModeDisabledReason || (needsCharacter && !hasCharacter) || (needsCharacterDrafts && !hasCharacterDrafts) || (needsCharacterStats && !hasCharacterStats);
+    if (ui.startBackupTooltip) {
+      if (draftWatermarkModeDisabledReason) {
+        ui.startBackupTooltip.dataset.tooltip = draftWatermarkModeDisabledReason;
+      } else {
+        delete ui.startBackupTooltip.dataset.tooltip;
+      }
+    }
     if (draftFlowBlocked) {
       ui.startBackupBtn.textContent = 'Come back tomorrow';
     } else if (postStats) {
-      ui.startBackupBtn.textContent = authenticated ? (state.postStatsScanning ? 'Scanning...' : 'scan post stats') : 'Sign in to start';
+      ui.startBackupBtn.textContent = authenticated ? (state.postStatsScanning ? 'Scanning...' : 'Save post stats') : 'Sign in to start';
     } else if (needsCharacterStats) {
-      ui.startBackupBtn.textContent = authenticated ? (state.characterStatsFetching ? 'Fetching...' : 'Get character stats') : 'Sign in to start';
+      ui.startBackupBtn.textContent = authenticated ? (state.characterStatsFetching ? 'Scanning...' : 'Save character stats') : 'Sign in to start';
     } else {
       ui.startBackupBtn.textContent = authenticated ? (promptExport ? 'Save prompts' : 'Start backup') : 'Sign in to start';
     }
-    ui.cancelBackupBtn.disabled = specialScope ? true : (!runActive || state.cancelPending);
-    ui.cancelBackupBtn.dataset.tone = runActive && !specialScope ? 'active' : 'idle';
-    ui.cancelBackupBtn.textContent = state.cancelPending ? 'Stopping...' : (runActive && !specialScope ? 'Stop' : 'Stopped');
+    ui.cancelBackupBtn.disabled = !stopActive || cancelPending;
+    ui.cancelBackupBtn.dataset.tone = stopActive ? 'active' : 'idle';
+    ui.cancelBackupBtn.textContent = cancelPending ? 'Stopping...' : (stopActive ? 'Stop' : 'Stopped');
+    ui.openLoginBtn.disabled = runActive;
+    ui.manualBearerBtn.disabled = runActive;
+    ui.chooseDirBtn.disabled = runActive;
+    ui.openRunFolderBtn.disabled = false;
     ui.clearCacheBtn.disabled = runActive || state.clearCacheLoading || state.clearCacheSubmitting;
+    ui.modeSelect.disabled = runActive;
+    ui.audioModeSelect.disabled = runActive;
+    ui.framingModeSelect.disabled = runActive;
+    ui.characterHandle.disabled = scopeSelectionLocked;
+    ui.characterDraftsHandle.disabled = scopeSelectionLocked;
+    ui.characterStatsHandle.disabled = scopeSelectionLocked;
+    if (ui.postStatsExportBtn) ui.postStatsExportBtn.disabled = runActive || !state.postStatsData.length;
+    document.querySelectorAll('input[name="scope"]').forEach((input) => {
+      if (lockedScope) input.checked = input.value === lockedScope;
+      input.disabled = scopeSelectionLocked && input.value !== selectedScope;
+    });
+    document.querySelectorAll('.route-row').forEach((row) => {
+      const radio = row.querySelector('input[name="scope"]');
+      row.dataset.runLocked = scopeSelectionLocked && radio && radio.value !== selectedScope ? 'true' : 'false';
+    });
     renderPostStatsSection();
   }
 
@@ -713,6 +1063,7 @@
     ui.clearCacheCancelBtn.disabled = state.clearCacheSubmitting;
     ui.clearCacheConfirmBtn.disabled = state.clearCacheLoading || state.clearCacheSubmitting || !hasSelectedClearCachePayload();
     ui.clearCacheConfirmBtn.textContent = state.clearCacheSubmitting ? 'Clearing…' : 'Clear selected cache';
+    syncClearCacheToggleButton();
 
     if (state.clearCacheLoading) return;
 
@@ -730,6 +1081,7 @@
       ui.clearCacheCharactersList.appendChild(createClearCacheOption('character', target.key, target.label));
     }
 
+    syncClearCacheToggleButton();
     ui.clearCacheConfirmBtn.disabled = state.clearCacheSubmitting || !hasSelectedClearCachePayload();
   }
 
@@ -738,7 +1090,7 @@
     ui.manualBearerModal.hidden = !state.manualBearerModalOpen;
     if (!state.manualBearerModalOpen) return;
     ui.manualBearerInput.disabled = state.manualBearerSubmitting;
-    ui.manualBearerCancelBtn.disabled = state.manualBearerSubmitting;
+    ui.manualBearerCancelBtn.disabled = false;
     ui.manualBearerConfirmBtn.disabled = state.manualBearerSubmitting || !String(ui.manualBearerInput.value || '').trim();
     ui.manualBearerConfirmBtn.textContent = state.manualBearerSubmitting ? 'Connecting…' : 'Connect';
     ui.manualBearerStatus.hidden = !state.manualBearerStatus;
@@ -750,12 +1102,12 @@
     ui.draftCookieModal.hidden = !state.draftCookieModalOpen;
     if (!state.draftCookieModalOpen) return;
     const needsBearer = draftCookieModalNeedsBearer();
-    setText(ui.draftCookieTitle, needsBearer ? 'Cookie + bearer needed!' : 'Cookie needed!');
+    setText(ui.draftCookieTitle, 'For Drafts, you need to provide more info!');
     setText(
       ui.draftCookieHelp,
       needsBearer
-        ? 'In order to save your drafts watermark free, you need to visit Sora in your browser and copy both the raw Cookie header and the matching Bearer Authorization from the same network request, pasting them below.'
-        : 'In order to save your drafts watermark free, you need to visit Sora in your browser and copy the raw Cookie header from the same browser session. Your saved bearer token will be reused for this run.'
+        ? 'To save your Drafts without a watermark, we must run Copy Link on every single one. All you need to do is open Sora in your browser, right-click it to Inspect the page, then go to Network tab and refresh. Click through the various Fetch requests until you spot "Cookie" and "Authentication" tokens underneath the Headers tab (huge walls of text). Copy & paste each of those into these two text boxes, and the app will handle the rest!'
+        : 'To save your Drafts without a watermark, we must run Copy Link on every single one. All you need to do is open Sora in your browser, right-click it to Inspect the page, then go to Network tab and refresh. Click through the various Fetch requests until you spot "Cookie" and "Authentication" tokens underneath the Headers tab (huge walls of text). Copy & paste that into the text box, and the app will handle the rest!'
     );
     if (ui.draftBearerField) ui.draftBearerField.hidden = !needsBearer;
     ui.draftCookieInput.disabled = state.draftCookieSubmitting;
@@ -796,7 +1148,10 @@
   }
 
   function closeManualBearerModal() {
-    if (state.manualBearerSubmitting) return;
+    if (state.manualBearerSubmitting) {
+      state.manualBearerSubmitting = false;
+    }
+    state.manualBearerVisibleRequestId = 0;
     state.manualBearerModalOpen = false;
     state.manualBearerStatus = '';
     renderManualBearerModal();
@@ -814,6 +1169,11 @@
 
   async function openDraftCookieModal(pendingRequest) {
     state.pendingDraftCookieBackupRequest = pendingRequest || null;
+    try {
+      const bootstrap = await appApi.getBootstrap();
+      applyBootstrapSnapshot(bootstrap || {});
+    } catch (_error) {}
+    syncManualBearerPresence();
     state.draftCookieModalOpen = true;
     state.draftCookieStatus = '';
     if (ui.draftCookieInput) ui.draftCookieInput.value = '';
@@ -864,99 +1224,11 @@
 
   function renderPostStatsSection() {
     if (!ui.postStatsSection) return;
-    const show = isPostStatsScope() && state.postStatsData.length > 0;
-    ui.postStatsSection.hidden = !show;
-    if (!show) return;
-    setText(ui.postStatsCount, state.postStatsData.length + ' posts');
-    ui.postStatsExportBtn.disabled = state.postStatsData.length === 0;
+    ui.postStatsSection.hidden = true;
   }
 
   function renderPostStatsTable() {
-    if (!ui.postStatsBody) return;
-    ui.postStatsBody.replaceChildren();
-    for (let i = 0; i < state.postStatsData.length; i += 1) {
-      const p = state.postStatsData[i];
-      const tr = document.createElement('tr');
-      const cells = [
-        p.post_id,
-        formatPostTimestamp(p.timestamp),
-        { value: p.caption, className: 'caption-cell' },
-        { value: p.permalink, link: true },
-        formatCount(p.view_count),
-        formatCount(p.unique_view_count),
-        formatCount(p.like_count),
-        formatCount(p.reply_count),
-        formatCount(p.recursive_reply_count),
-        formatCount(p.share_count),
-        formatCount(p.repost_count),
-        formatCount(p.remix_count),
-        p.duration_s || '',
-        p.width || '',
-        p.height || '',
-        { value: p.thumbnail_url, link: true, linkText: p.thumbnail_url ? 'View' : '' },
-      ];
-      for (let j = 0; j < cells.length; j += 1) {
-        const td = document.createElement('td');
-        const cell = cells[j];
-        if (cell && typeof cell === 'object') {
-          if (cell.className) td.className = cell.className;
-          if (cell.link && cell.value) {
-            const a = document.createElement('a');
-            a.href = cell.value;
-            a.target = '_blank';
-            a.rel = 'noreferrer noopener';
-            a.textContent = cell.linkText != null ? cell.linkText : cell.value;
-            td.appendChild(a);
-          } else {
-            td.textContent = cell.value || '';
-          }
-        } else {
-          td.textContent = cell != null ? String(cell) : '';
-        }
-        tr.appendChild(td);
-      }
-      ui.postStatsBody.appendChild(tr);
-    }
     renderPostStatsSection();
-    queueWindowResize();
-  }
-
-  function exportPostStatsCsv() {
-    if (!state.postStatsData.length) return;
-    const headers = ['Post ID', 'Post Date', 'Caption', 'Post URL', 'Total Views', 'Unique Views', 'Likes', 'Replies', 'Total Replies', 'Shares', 'Reposts', 'Remixes', 'Video Duration (s)', 'Video Width', 'Video Height', 'Thumbnail URL'];
-    const rows = [headers.join(',')];
-    for (let i = 0; i < state.postStatsData.length; i += 1) {
-      const p = state.postStatsData[i];
-      const row = [
-        p.post_id,
-        formatPostTimestamp(p.timestamp),
-        '"' + String(p.caption || '').replace(/"/g, '""') + '"',
-        p.permalink,
-        p.view_count,
-        p.unique_view_count,
-        p.like_count,
-        p.reply_count,
-        p.recursive_reply_count,
-        p.share_count,
-        p.repost_count,
-        p.remix_count,
-        p.duration_s,
-        p.width,
-        p.height,
-        p.thumbnail_url,
-      ];
-      rows.push(row.join(','));
-    }
-    const csv = rows.join('\n');
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'sora_post_stats_' + new Date().toISOString().slice(0, 10) + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
   }
 
   async function handleScanPostStats() {
@@ -971,29 +1243,44 @@
     }
     state.postStatsScanning = true;
     state.postStatsData = [];
-    state.postStatsPage = 0;
-    state.headerNotice = '';
+    resetPostStatsScanProgress();
+    state.headerNotice = getPostStatsScanLabel();
     renderAll();
     renderPostStatsTable();
     try {
       const response = await appApi.scanPostStats();
       if (!response || !response.ok) {
-        state.headerNotice = response && response.error ? response.error : 'Post stats scan failed.';
         state.postStatsScanning = false;
+        state.cancelPending = false;
+        state.postStatsRetrying = false;
+        state.postStatsRetryAttempt = 0;
+        state.postStatsRetryMaxAttempts = 0;
+        state.headerNotice = isCancelledOperationMessage(response && response.error)
+          ? getPostStatsCancelledLabel()
+          : (response && response.error ? response.error : 'Post stats scan failed.');
         renderAll();
         return;
       }
       state.postStatsData = response.posts || [];
       state.postStatsScanning = false;
+      state.cancelPending = false;
+      state.postStatsProgressCount = state.postStatsData.length;
+      state.postStatsRetrying = false;
+      state.postStatsRetryAttempt = 0;
+      state.postStatsRetryMaxAttempts = 0;
       const savedFilename = response.savedPath ? response.savedPath.split(/[\\/]/).pop() : null;
-      state.headerNotice = state.postStatsData.length + ' posts scanned!' + (savedFilename ? ' Saved to ' + savedFilename + '.' : '');
+      state.headerNotice = state.postStatsData.length + ' posts scanned!' + (savedFilename ? ' Saved to folder.' : '');
       renderAll();
       renderPostStatsTable();
     } catch (error) {
       state.postStatsScanning = false;
-      state.headerNotice = String((error && error.message) || error || 'Post stats scan failed.');
-      renderHeader();
-      renderControls();
+      state.cancelPending = false;
+      state.postStatsRetrying = false;
+      state.postStatsRetryAttempt = 0;
+      state.postStatsRetryMaxAttempts = 0;
+      const message = String((error && error.message) || error || 'Post stats scan failed.');
+      state.headerNotice = isCancelledOperationMessage(message) ? getPostStatsCancelledLabel() : message;
+      renderAll();
     }
   }
 
@@ -1010,70 +1297,39 @@
     const handle = String(ui.characterStatsHandle.value || '').trim().replace(/^@/, '');
     if (!handle) return;
     state.characterStatsFetching = true;
-    state.headerNotice = '';
+    state.headerNotice = getCharacterStatsFetchLabel();
+    renderHeader();
     renderControls();
     try {
       const response = await appApi.fetchCharacterStats(handle);
       state.characterStatsFetching = false;
+      state.cancelPending = false;
       if (!response.ok) {
-        state.headerNotice = response.error || 'Failed to fetch character stats.';
+        state.headerNotice = isCancelledOperationMessage(response && response.error)
+          ? getCharacterStatsCancelledLabel()
+          : (response.error || 'Failed to fetch character stats.');
         renderHeader();
         renderControls();
         return;
       }
-      exportCharacterStatsCsv(response.profile, handle);
-      state.headerNotice = 'Character stats downloaded!';
+      const savedFilename = response.savedPath ? response.savedPath.split(/[\\/]/).pop() : null;
+      state.headerNotice = savedFilename ? 'Done! Stats saved to folder.' : 'Character stats downloaded!';
       renderHeader();
       renderControls();
     } catch (error) {
       state.characterStatsFetching = false;
-      state.headerNotice = String((error && error.message) || error || 'Character stats fetch failed.');
+      state.cancelPending = false;
+      const message = String((error && error.message) || error || 'Character stats fetch failed.');
+      state.headerNotice = isCancelledOperationMessage(message) ? getCharacterStatsCancelledLabel() : message;
       renderHeader();
       renderControls();
     }
   }
 
-  function exportCharacterStatsCsv(profile, handle) {
-    if (!profile) return;
-    const formatTs = (ts) => ts ? new Date(Number(ts) * 1000).toISOString() : '';
-    const fields = [
-      ['Username', profile.username],
-      ['Display Name', profile.display_name],
-      ['User ID', profile.user_id],
-      ['Permalink', profile.permalink],
-      ['Followers', profile.follower_count],
-      ['Following', profile.following_count],
-      ['Posts', profile.post_count],
-      ['Replies', profile.reply_count],
-      ['Likes Received', profile.likes_received_count],
-      ['Remixes', profile.remix_count],
-      ['Cameos', profile.cameo_count],
-      ['Characters', profile.character_count],
-      ['Verified', profile.verified],
-      ['Can Cameo', profile.can_cameo],
-      ['Created At', formatTs(profile.created_at)],
-      ['Updated At', formatTs(profile.updated_at)],
-    ].filter(([, v]) => v !== null && v !== undefined && v !== '');
-    const headers = fields.map(([k]) => k).join(',');
-    const values = fields.map(([, v]) => {
-      const s = String(v);
-      return s.includes(',') || s.includes('"') || s.includes('\n') ? '"' + s.replace(/"/g, '""') + '"' : s;
-    }).join(',');
-    const csv = headers + '\n' + values;
-    const blob = new Blob([csv], { type: 'text/csv' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = 'sora_character_stats_' + (handle || 'unknown') + '_' + new Date().toISOString().slice(0, 10) + '.csv';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-  }
-
   function renderAll() {
     updateWorkingDotsTimer();
     renderSession();
+    renderMusicToggle();
     renderHeader();
     renderScopeProgress();
     renderControls();
@@ -1087,6 +1343,10 @@
   }
 
   function measureContentHeight() {
+    const shell = document.querySelector('.panel-shell');
+    if (shell) {
+      return Math.ceil(shell.scrollHeight);
+    }
     const bodyHeight = document.body ? document.body.scrollHeight : 0;
     const documentHeight = document.documentElement ? document.documentElement.scrollHeight : 0;
     return Math.ceil(Math.max(bodyHeight, documentHeight));
@@ -1118,6 +1378,9 @@
     if (data.settings) {
       state.settings = Object.assign({}, state.settings, data.settings);
       state.settings.published_download_mode = normalizePublishedDownloadMode(state.settings.published_download_mode);
+      if (state.settings.has_manual_bearer_token) {
+        state.manualBearerConnected = true;
+      }
     }
     if (Object.prototype.hasOwnProperty.call(data, 'session')) {
       state.session = data.session || null;
@@ -1130,6 +1393,17 @@
     }
     if (Object.prototype.hasOwnProperty.call(data, 'draft_publish_usage')) {
       state.draftPublishUsage = normalizeDraftPublishUsage(data.draft_publish_usage);
+    }
+    if (state.session && state.session.authenticated === false) {
+      state.manualBearerConnected = false;
+      state.settings.has_manual_bearer_token = false;
+      state.settings.has_manual_cookie_header = false;
+      setRun(null, { initialize: true });
+      state.bucketProgress = null;
+      state.postStatsScanning = false;
+      resetPostStatsScanProgress();
+      state.postStatsData = [];
+      state.characterStatsFetching = false;
     }
   }
 
@@ -1243,6 +1517,11 @@
   }
 
   async function handleStartBackup() {
+    const draftWatermarkModeDisabledReason = getDraftWatermarkModeDisabledReason(getSelectedScope());
+    if (draftWatermarkModeDisabledReason) {
+      renderControls();
+      return;
+    }
     if (isPostStatsScope()) {
       handleScanPostStats().catch(() => {});
       return;
@@ -1311,7 +1590,7 @@
   }
 
   async function handleCancelBackup() {
-    if (state.cancelPending) return;
+    if (state.cancelPending || !hasCancelableForegroundWork()) return;
     state.cancelPending = true;
     renderAll();
     await new Promise((resolve) => window.requestAnimationFrame(() => resolve()));
@@ -1329,8 +1608,7 @@
   }
 
   async function handleOpenRunFolder() {
-    const runId = state.run && state.run.id;
-    if (!runId) return;
+    const runId = state.run && state.run.id ? state.run.id : '';
     const response = await appApi.openRunFolder(runId);
     if (!response.ok) {
       state.headerNotice = response.error || 'Could not open the download folder.';
@@ -1442,6 +1720,13 @@
   }
 
   function handleOpenManualBearerModal() {
+    if (state.session && state.session.authenticated) {
+      state.logoutModalOpen = true;
+      state.logoutStatus = '';
+      renderLogoutModal();
+      queueWindowResize();
+      return;
+    }
     state.manualBearerModalOpen = true;
     state.manualBearerStatus = '';
     renderManualBearerModal();
@@ -1462,34 +1747,65 @@
       return;
     }
 
+    const requestId = state.manualBearerAttemptSeq + 1;
+    state.manualBearerAttemptSeq = requestId;
+    state.manualBearerVisibleRequestId = requestId;
     state.manualBearerSubmitting = true;
     state.manualBearerStatus = '';
     renderManualBearerModal();
     try {
       const response = await appApi.connectWithBearerToken(token);
+      const isLatestAttempt = state.manualBearerAttemptSeq === requestId;
+      const isVisibleAttempt = state.manualBearerVisibleRequestId === requestId;
       if (!response || !response.ok) {
+        if (!isLatestAttempt || !isVisibleAttempt) return;
         state.session = response && response.session ? response.session : state.session;
         state.manualBearerStatus = formatManualBearerError(response && response.error);
         state.manualBearerSubmitting = false;
+        state.manualBearerVisibleRequestId = 0;
         renderManualBearerModal();
         renderSession();
         return;
       }
 
+      if (!isLatestAttempt) return;
       applyBootstrapSnapshot(response && response.bootstrap ? response.bootstrap : {
         session: response.session || state.session,
         settings: response.settings || state.settings,
       });
+      state.manualBearerConnected = true;
+      state.settings.has_manual_bearer_token = true;
+      if (state.draftCookieModalOpen) {
+        state.draftCookieStatus = '';
+        if (ui.draftBearerInput) ui.draftBearerInput.value = '';
+        renderDraftCookieModal();
+        queueWindowResize();
+        window.requestAnimationFrame(() => {
+          if (!ui.draftCookieInput) return;
+          ui.draftCookieInput.focus();
+          ui.draftCookieInput.select();
+        });
+      }
       state.awaitingLoginCompletion = false;
       state.sessionPrompt = '';
       state.headerNotice = response.message || '';
+      if (!isVisibleAttempt) {
+        state.manualBearerSubmitting = false;
+        renderAll();
+        return;
+      }
       state.manualBearerSubmitting = false;
+      state.manualBearerVisibleRequestId = 0;
       state.manualBearerModalOpen = false;
       state.manualBearerStatus = '';
       ui.manualBearerInput.value = '';
       renderAll();
     } catch (error) {
+      const isLatestAttempt = state.manualBearerAttemptSeq === requestId;
+      const isVisibleAttempt = state.manualBearerVisibleRequestId === requestId;
+      if (!isLatestAttempt || !isVisibleAttempt) return;
       state.manualBearerSubmitting = false;
+      state.manualBearerVisibleRequestId = 0;
       state.manualBearerStatus = formatManualBearerError((error && error.message) || error);
       renderManualBearerModal();
     }
@@ -1524,6 +1840,10 @@
       setRun(Object.prototype.hasOwnProperty.call(bootstrap, 'run') ? (bootstrap.run || null) : state.run, { initialize: true });
       state.bucketProgress = bootstrap.bucket_progress || state.bucketProgress;
       state.clearCacheTargets = response.targets || state.clearCacheTargets;
+      if (payload.modes.indexOf('postStats') >= 0) {
+        state.postStatsData = [];
+        resetPostStatsScanProgress();
+      }
       state.headerNotice = 'Cache cleared.';
       state.clearCacheSubmitting = false;
       state.clearCacheModalOpen = false;
@@ -1561,9 +1881,14 @@
         session: response.session || null,
         settings: response.settings || state.settings,
       });
+      state.manualBearerConnected = false;
       state.awaitingLoginCompletion = false;
       state.sessionPrompt = '';
       state.headerNotice = 'Logged out.';
+      state.postStatsScanning = false;
+      resetPostStatsScanProgress();
+      state.postStatsData = [];
+      state.characterStatsFetching = false;
       state.logoutSubmitting = false;
       state.logoutModalOpen = false;
       state.logoutStatus = '';
@@ -1575,8 +1900,32 @@
     }
   }
 
+  async function handleToggleMusic() {
+    if (state.musicPlaying) {
+      stopMusicPlayback();
+      state.musicPlaying = false;
+      renderMusicToggle();
+      return;
+    }
+
+    try {
+      const audio = ensureMusicAudio();
+      audio.loop = true;
+      await audio.play();
+      state.musicPlaying = true;
+      renderMusicToggle();
+    } catch (_error) {
+      stopMusicPlayback();
+      state.musicPlaying = false;
+      renderMusicToggle();
+    }
+  }
+
   ui.openLoginBtn.addEventListener('click', handleOpenLogin);
   ui.manualBearerBtn.addEventListener('click', handleOpenManualBearerModal);
+  ui.musicToggleBtn.addEventListener('click', () => {
+    handleToggleMusic().catch(() => {});
+  });
   ui.chooseDirBtn.addEventListener('click', handleChooseDir);
   ui.startBackupBtn.addEventListener('click', handleStartBackup);
   ui.cancelBackupBtn.addEventListener('click', handleCancelBackup);
@@ -1584,6 +1933,15 @@
   ui.clearCacheBtn.addEventListener('click', handleOpenClearCache);
   ui.clearCacheCancelBtn.addEventListener('click', closeClearCacheModal);
   ui.clearCacheConfirmBtn.addEventListener('click', handleConfirmClearCache);
+  ui.clearCacheToggleBtn.addEventListener('click', () => {
+    if (state.clearCacheLoading || state.clearCacheSubmitting) return;
+    const shouldSelectAll = !areAllClearCacheOptionsSelected();
+    getClearCacheOptionInputs().forEach((input) => {
+      input.checked = shouldSelectAll;
+    });
+    ui.clearCacheConfirmBtn.disabled = state.clearCacheSubmitting || !hasSelectedClearCachePayload();
+    syncClearCacheToggleButton();
+  });
   ui.clearCacheBackdrop.addEventListener('click', closeClearCacheModal);
   ui.macLoginNoteConfirmBtn.addEventListener('click', () => {
     handleConfirmMacLoginNote().catch(() => {});
@@ -1601,6 +1959,7 @@
   ui.clearCacheModal.addEventListener('change', (event) => {
     if (!event.target || !event.target.matches('input[data-clear-cache-type]')) return;
     ui.clearCacheConfirmBtn.disabled = state.clearCacheSubmitting || !hasSelectedClearCachePayload();
+    syncClearCacheToggleButton();
   });
   ui.manualBearerInput.addEventListener('input', () => {
     if (state.manualBearerStatus) {
@@ -1648,20 +2007,18 @@
   });
 
   if (ui.postStatsExportBtn) {
-    ui.postStatsExportBtn.addEventListener('click', exportPostStatsCsv);
+    ui.postStatsExportBtn.hidden = true;
   }
 
   appApi.onPostStatsProgress((progress) => {
-    if (!progress) return;
+    if (!progress || !state.postStatsScanning) return;
     state.postStatsPage = progress.page || 0;
     state.postStatsProgressCount = progress.count || 0;
-    if (progress.retrying) {
-      state.headerNotice = 'Scanning page ' + progress.page + '… (retry ' + progress.attempt + '/' + progress.maxAttempts + ')';
-    } else {
-      state.headerNotice = 'Scanning page ' + progress.page + '… (' + progress.count + ' posts found)';
-    }
+    state.postStatsRetrying = progress.retrying === true;
+    state.postStatsRetryAttempt = progress.attempt || 0;
+    state.postStatsRetryMaxAttempts = progress.maxAttempts || 0;
     renderHeader();
-    setText(ui.scopeProgressPostStats, String(state.postStatsProgressCount));
+    renderScopeProgress();
   });
 
   ui.modeSelect.addEventListener('change', () => {
@@ -1674,6 +2031,7 @@
     persistSettings({ framing_mode: ui.framingModeSelect.value }).catch(() => {});
   });
   function selectCharacterScope() {
+    if (isScopeSelectionLocked()) return;
     const radio = document.querySelector('input[name="scope"][value="characterPosts"]');
     if (!radio || radio.checked) return;
     radio.checked = true;
@@ -1718,6 +2076,7 @@
     persistSettings({ character_handle: ui.characterHandle.value.trim(), character_drafts_handle: ui.characterHandle.value.trim(), character_stats_handle: ui.characterHandle.value.trim() }).catch(() => {});
   });
   function selectCharacterDraftsScope() {
+    if (isScopeSelectionLocked()) return;
     const radio = document.querySelector('input[name="scope"][value="characterDrafts"]');
     if (!radio || radio.checked) return;
     radio.checked = true;
@@ -1742,6 +2101,7 @@
     persistSettings({ character_drafts_handle: ui.characterDraftsHandle.value.trim(), character_handle: ui.characterDraftsHandle.value.trim(), character_stats_handle: ui.characterDraftsHandle.value.trim() }).catch(() => {});
   });
   function selectCharacterStatsScope() {
+    if (isScopeSelectionLocked()) return;
     const radio = document.querySelector('input[name="scope"][value="characterStats"]');
     if (!radio || radio.checked) return;
     radio.checked = true;
@@ -1767,15 +2127,23 @@
   });
   document.querySelectorAll('input[name="scope"]').forEach((input) => {
     input.addEventListener('change', () => {
+      if (isScopeSelectionLocked()) {
+        setSelectedScope(getLockedScope() || state.settings.selectedScope || 'ownPosts');
+        return;
+      }
       state.settings.selectedScope = getSelectedScope();
       renderHeader();
       renderScopeProgress();
       renderControls();
-      persistSettings({ selectedScope: state.settings.selectedScope }).catch(() => {});
+      persistSettings({
+        selectedScope: state.settings.selectedScope,
+        published_download_mode: state.settings.published_download_mode,
+      }).catch(() => {});
     });
   });
   document.querySelectorAll('.route-row').forEach((row) => {
     row.addEventListener('click', (event) => {
+      if (isScopeSelectionLocked()) return;
       if (event.target.closest('.route-input')) return;
       const radio = row.querySelector('input[name="scope"]');
       if (!radio || radio.checked) return;
@@ -1807,6 +2175,7 @@
   });
   window.addEventListener('beforeunload', () => {
     state.awaitingLoginCompletion = false;
+    stopMusicPlayback();
   });
   window.addEventListener('keydown', (event) => {
     if (event.key !== 'Escape') return;
