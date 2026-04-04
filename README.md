@@ -1,6 +1,6 @@
 # Sora Video Downloader
 
-Desktop app for saving your Sora videos and draft prompts! [**Get the app here!**](https://github.com/cameoed/sora-video-downloader/releases/tag/v1.0.0)
+Desktop app for saving your Sora videos and draft prompts! [**Get the app here!**](https://github.com/cameoed/sora-video-downloader/releases/tag/v1.1.0)
 
 ![Sora Video Downloader app preview](./icons/preview.png)
 
