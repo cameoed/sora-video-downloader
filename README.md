@@ -6,9 +6,9 @@ Desktop app for saving your Sora videos and draft prompts! [**Get the app here!*
 
 ## Features
 
-- Sign in through the built-in `Open Sora` flow
+- Sign in through the built-in `Open Sora` flow, with manual bearer-key fallback if needed
 - Save from:
-  `My Posts`, `My Drafts`, `My Draft Prompts`, `Cast-in Posts`, `Drafts of Me`, and `Character`
+  `My Posts`, `My Drafts`, `My Draft Prompts`, `Cast-in Posts`, `Drafts of Me`, `My Post Stats`, `Character Posts`, `Character Drafts`, and `Character Stats`
 - No-watermark mode with provider failover
 - AI label controls:
   `No AI Label` or `With AI Label`
@@ -47,7 +47,7 @@ Windows:
 3. Sign in
 4. Pick a backup type
 5. Pick your settings and download folder
-6. Click `Start backup` or `Save prompts`
+6. Click `Start backup`, `Save prompts`, `Save post stats`, or `Save character stats`
 
 ## Backup Types
 
@@ -67,8 +67,17 @@ Windows:
 - `Drafts of Me`
   Downloads drafts where you appear.
 
-- `Character`
+- `My Post Stats`
+  Saves a CSV of your post stats.
+
+- `Character Posts`
   Downloads posts for the handle entered in the character box.
+
+- `Character Drafts`
+  Downloads drafts for the handle entered in the character box.
+
+- `Character Stats`
+  Saves a CSV of stats for the handle entered in the character box.
 
 ## Settings
 
@@ -76,6 +85,7 @@ Windows:
   `No Watermark` tries to save a no-watermark version.
   `With Watermark` keeps the original version.
   For draft downloads, `No Watermark` first creates an unlisted shared link and then sends that public link through the existing no-watermark providers.
+  If Sora requires more auth for draft no-watermark downloads, the app will prompt for the matching Cookie and Bearer headers from your browser session.
   The app tracks these draft copy-link actions locally because Sora only allows `500` of them per day.
 
 - `AI Label`
@@ -110,6 +120,7 @@ The CSV starts with:
 ## Cache
 
 `Clear cache` resets remembered download history for selected modes or characters.
+Remembered download history is tracked separately for each Watermark / AI Label / Crop combination.
 It does not delete files already saved on disk.
 Interrupted scans are checkpointed locally, so restarting a failed backup resumes from the last saved page cursor and reuses completed scan results for unfinished downloads when possible.
 
