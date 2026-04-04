@@ -14,13 +14,17 @@
             <div class="panel-title-copy">
               <h1>Sora Video Downloader</h1>
               <p id="heroSubtitle" class="panel-subtitle">Click 'Open Sora' in the corner and log in to access your archive.</p>
+              <p id="heroDetail" class="panel-detail" hidden></p>
             </div>
-            <button id="openLoginBtn" type="button" class="session-pill" data-tone="warn">Open Sora</button>
+            <div class="session-actions">
+              <button id="openLoginBtn" type="button" class="session-pill" data-tone="warn">Open Sora</button>
+              <button id="manualBearerBtn" type="button" class="session-icon-button" data-tone="warn" aria-label="Connect with bearer token">🔒</button>
+            </div>
           </div>
 
           <div class="panel-progress-meta">
             <span id="progressBadge" class="panel-progress-badge">0% complete</span>
-            <button id="openRunFolderBtn" type="button" class="panel-link-button" hidden>Open folder</button>
+            <button id="openRunFolderBtn" type="button" class="panel-link-button">Open folder</button>
             <button id="clearCacheBtn" type="button" class="panel-link-button">Clear cache</button>
           </div>
 
@@ -93,13 +97,40 @@
                     <span id="scopeProgressCastInDrafts" class="route-progress">?</span>
                   </div>
 
+                  <div class="route-row route-row--post-stats">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="postStats">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-name">My Post Stats</span>
+                    </label>
+                    <span id="scopeProgressPostStats" class="route-progress">?</span>
+                  </div>
+
                   <div class="route-row route-row--character">
                     <label class="route-row--selectable">
                       <input type="radio" name="scope" value="characterPosts">
                       <span class="scope-dot" aria-hidden="true"></span>
-                      <input id="characterHandle" type="text" class="route-input" placeholder="@character">
+                      <span class="route-input-wrap"><input id="characterHandle" type="text" class="route-input" placeholder="@character posts"><span class="input-suffix" aria-hidden="true"> posts</span></span>
                     </label>
                     <span id="scopeProgressCharacterPosts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row route-row--character-drafts">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="characterDrafts">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-input-wrap"><input id="characterDraftsHandle" type="text" class="route-input" placeholder="@character drafts"><span class="input-suffix" aria-hidden="true"> drafts</span></span>
+                    </label>
+                    <span id="scopeProgressCharacterDrafts" class="route-progress">?</span>
+                  </div>
+
+                  <div class="route-row route-row--character-stats">
+                    <label class="route-row--selectable">
+                      <input type="radio" name="scope" value="characterStats">
+                      <span class="scope-dot" aria-hidden="true"></span>
+                      <span class="route-input-wrap"><input id="characterStatsHandle" type="text" class="route-input" placeholder="@character stats"><span class="input-suffix" aria-hidden="true"> stats</span></span>
+                    </label>
+                    <span id="scopeProgressCharacterStats" class="route-progress">?</span>
                   </div>
                 </div>
               </div>
@@ -148,10 +179,9 @@
                   </label>
 
                 </div>
-
                 <div class="settings-storage">
                   <label class="control-field control-field--wide" for="downloadDir">
-                    <span class="control-label">Save location</span>
+                    <span class="control-label">Download folder</span>
                     <div class="storage-field">
                       <input id="downloadDir" type="text" readonly>
                       <button id="chooseDirBtn" type="button" class="storage-button">Browse</button>
@@ -163,6 +193,41 @@
           </section>
         </div>
       </section>
+      <section id="postStatsSection" class="post-stats-section" hidden>
+        <div class="post-stats-header">
+          <p class="section-label">Post Stats</p>
+          <div class="post-stats-actions">
+            <span id="postStatsCount" class="post-stats-count"></span>
+            <button id="postStatsExportBtn" type="button" class="panel-link-button" disabled>Export CSV</button>
+          </div>
+        </div>
+        <div class="post-stats-table-wrap">
+          <table id="postStatsTable" class="post-stats-table">
+            <thead>
+              <tr>
+                <th>Post ID</th>
+                <th>Post Date</th>
+                <th>Caption</th>
+                <th>Post URL</th>
+                <th>Total Views</th>
+                <th>Unique Views</th>
+                <th>Likes</th>
+                <th>Replies</th>
+                <th>Total Replies</th>
+                <th>Shares</th>
+                <th>Reposts</th>
+                <th>Remixes</th>
+                <th>Video Duration (s)</th>
+                <th>Video Width</th>
+                <th>Video Height</th>
+                <th>Thumbnail URL</th>
+              </tr>
+            </thead>
+            <tbody id="postStatsBody"></tbody>
+          </table>
+        </div>
+      </section>
+
       <p class="panel-credit">
         built by
         <a href="http://discord.gg/topher" target="_blank" rel="noreferrer noopener">topher</a>
@@ -170,7 +235,8 @@
         <a href="https://github.com/lgcarrier" target="_blank" rel="noreferrer noopener">lgcarrier</a>,
         <a href="https://github.com/byeson" target="_blank" rel="noreferrer noopener">byeson</a>,
         <a href="https://github.com/slogonomo" target="_blank" rel="noreferrer noopener">slogonomo</a>,
-        <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>
+        <a href="https://github.com/alexdredmon" target="_blank" rel="noreferrer noopener">alexandria</a>,
+        <a href="https://github.com/nikaskeba/" target="_blank" rel="noreferrer noopener">udio</a>
         <br>
         watermark removal powered by
         <a href="https://kontenai.net?ref=topher" target="_blank" rel="noreferrer noopener">monson</a>
@@ -208,6 +274,107 @@
           <div class="cache-modal-actions">
             <button id="clearCacheCancelBtn" type="button" class="panel-link-button">Cancel</button>
             <button id="clearCacheConfirmBtn" type="button" class="storage-button">Clear selected cache</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="manualBearerModal" class="cache-modal" hidden>
+        <div id="manualBearerBackdrop" class="cache-modal-backdrop"></div>
+        <section class="cache-modal-card" role="dialog" aria-modal="true" aria-labelledby="manualBearerTitle">
+          <div class="cache-modal-head">
+            <div class="section-header section-header--tight">
+              <p class="section-label">Manual Connect</p>
+              <h2 id="manualBearerTitle" class="cache-modal-title">Problems logging in? You can paste your bearer key directly in the text field below to connect instead.</h2>
+            </div>
+          </div>
+
+          <div class="cache-modal-body">
+            <p class="section-note manual-bearer-help">To retrieve your Sora bearer key, visit your Sora profile in any browser, right-click and Inspect the page, click Network tab, refresh the browser, look for the row called "me", click it, click Headers, scroll down to find the wall of text called "Bearer abc123etc" and copy that entire value into the text field below!</p>
+            <label class="control-field" for="manualBearerInput">
+              <span class="control-label">Bearer Key</span>
+              <input id="manualBearerInput" type="text" placeholder="Bearer abc123etc..." autocomplete="off" spellcheck="false">
+            </label>
+            <p id="manualBearerStatus" class="cache-modal-status" hidden></p>
+          </div>
+
+          <div class="cache-modal-actions">
+            <button id="manualBearerCancelBtn" type="button" class="panel-link-button">Cancel</button>
+            <button id="manualBearerConfirmBtn" type="button" class="storage-button">Connect</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="draftCookieModal" class="cache-modal" hidden>
+        <div id="draftCookieBackdrop" class="cache-modal-backdrop"></div>
+        <section class="cache-modal-card" role="dialog" aria-modal="true" aria-labelledby="draftCookieTitle">
+          <div class="cache-modal-head">
+            <div class="section-header section-header--tight">
+              <p class="section-label">Draft Backup</p>
+              <h2 id="draftCookieTitle" class="cache-modal-title">Cookie + bearer needed!</h2>
+            </div>
+          </div>
+
+          <div class="cache-modal-body">
+            <p id="draftCookieHelp" class="section-note manual-bearer-help">In order to save your drafts watermark free, you need to visit Sora in your browser and copy both the raw Cookie header and the matching Bearer Bearer Authorization from the same network request, pasting them below.</p>
+            <label class="control-field" for="draftCookieInput">
+              <span class="control-label">Cookie</span>
+              <textarea id="draftCookieInput" placeholder="oai-did=abc123etc..." autocomplete="off" spellcheck="false"></textarea>
+            </label>
+            <label id="draftBearerField" class="control-field" for="draftBearerInput">
+              <span class="control-label">Bearer Authorization</span>
+              <textarea id="draftBearerInput" placeholder="Bearer abc123etc..." autocomplete="off" spellcheck="false"></textarea>
+            </label>
+            <p id="draftCookieStatus" class="cache-modal-status" hidden></p>
+          </div>
+
+          <div class="cache-modal-actions">
+            <button id="draftCookieCancelBtn" type="button" class="panel-link-button">Cancel</button>
+            <button id="draftCookieConfirmBtn" type="button" class="storage-button">Continue</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="macLoginNoteModal" class="cache-modal" hidden>
+        <div id="macLoginNoteBackdrop" class="cache-modal-backdrop"></div>
+        <section class="cache-modal-card" role="dialog" aria-modal="true" aria-labelledby="macLoginNoteTitle">
+          <div class="cache-modal-head">
+            <div class="section-header section-header--tight">
+              <p class="section-label">Quick Note</p>
+              <h2 id="macLoginNoteTitle" class="cache-modal-title">Quick note about Google Login</h2>
+            </div>
+          </div>
+
+          <div class="cache-modal-body">
+            <p class="section-note">
+              Google auth will reject your log in. Simply visit
+              <a href="https://chatgpt.com/#settings/Security" target="_blank" rel="noreferrer noopener">this link</a>
+              to add a password to your account, then come back here and enter your email directly into the email address field to log in that way instead.
+            </p>
+          </div>
+
+          <div class="cache-modal-actions">
+            <button id="macLoginNoteConfirmBtn" type="button" class="storage-button">Understood</button>
+          </div>
+        </section>
+      </div>
+
+      <div id="logoutModal" class="cache-modal" hidden>
+        <div id="logoutBackdrop" class="cache-modal-backdrop"></div>
+        <section class="cache-modal-card" role="dialog" aria-modal="true" aria-labelledby="logoutTitle">
+          <div class="cache-modal-head">
+            <div class="section-header section-header--tight">
+              <p class="section-label">Log Out</p>
+              <h2 id="logoutTitle" class="cache-modal-title">Would you like to log out?</h2>
+            </div>
+          </div>
+
+          <div class="cache-modal-body">
+            <p id="logoutStatus" class="cache-modal-status" hidden></p>
+          </div>
+
+          <div class="cache-modal-actions">
+            <button id="logoutCancelBtn" type="button" class="storage-button">No</button>
+            <button id="logoutConfirmBtn" type="button" class="storage-button">Yes</button>
           </div>
         </section>
       </div>

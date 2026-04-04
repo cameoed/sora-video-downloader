@@ -19,7 +19,7 @@ Desktop app for saving your Sora videos and draft prompts! [**Get the app here!*
 - `Clear cache` for remembered download history
 - Prompt CSV export with similar draft prompts de-duplicated
 
-Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), [alexandria](https://github.com/alexdredmon).
+Built by [topher](https://github.com/cameoed) with huge contributions by [lgcarrier](https://github.com/lgcarrier), [byeson](https://github.com/byeson), [slogonomo](https://github.com/slogonomo), [alexandria](https://github.com/alexdredmon), [udio](https://github.com/nikaskeba/).
 
 Watermark removal powered by [monson](https://kontenai.net?ref=topher) and [soravdl](https://soravdl.com).
 
@@ -46,7 +46,7 @@ Windows:
 2. Click `Open Sora`
 3. Sign in
 4. Pick a backup type
-5. Pick your settings and save location
+5. Pick your settings and download folder
 6. Click `Start backup` or `Save prompts`
 
 ## Backup Types
@@ -75,6 +75,8 @@ Windows:
 - `Video Mode`
   `No Watermark` tries to save a no-watermark version.
   `With Watermark` keeps the original version.
+  For draft downloads, `No Watermark` first creates an unlisted shared link and then sends that public link through the existing no-watermark providers.
+  The app tracks these draft copy-link actions locally because Sora only allows `500` of them per day.
 
 - `AI Label`
   `No AI Label` removes the audiomark and strips C2PA manifest data.
@@ -84,16 +86,23 @@ Windows:
   `Default Crop` keeps the source framing.
   `16:9 for Social` exports social-ready framing.
 
-- `Save location`
-  Chooses where downloads and prompt CSVs are written.
+- `Download folder`
+  Chooses the download folder where exports and prompt CSVs are written.
 
 ## Output
 
-Everything is saved inside a `Sora Video Downloader` folder in your chosen save location.
+By default, everything is saved in `~/Downloads/Sora Video Downloader`.
 
-Video runs create folders based on the selected backup type and export settings.
+Inside that download folder, export folders keep the existing settings in the same folder name, with the logged-in account added in front, for example:
 
-`My Draft Prompts` writes a CSV file named `my-prompts.csv` inside `Sora Video Downloader/My Sora Prompts`.
+- `@username's Sora Posts - No Watermark, With Label, Default Crop`
+- `@username's Sora Drafts - No Watermark, With Label, Default Crop`
+- `@username's Cast-In Posts - No Watermark, With Label, Default Crop`
+- `@username's Sora Prompts`
+
+Character post downloads use the character handle as the folder name, for example `@character - No Watermark, With Label, Default Crop`.
+
+`My Draft Prompts` writes a CSV file named like `@username's Draft Prompts.csv` inside `@username's Sora Prompts`.
 The CSV starts with:
 
 `All draft prompts with similar prompts de-duplicated!`
@@ -102,6 +111,7 @@ The CSV starts with:
 
 `Clear cache` resets remembered download history for selected modes or characters.
 It does not delete files already saved on disk.
+Interrupted scans are checkpointed locally, so restarting a failed backup resumes from the last saved page cursor and reuses completed scan results for unfinished downloads when possible.
 
 ## Run From Source
 

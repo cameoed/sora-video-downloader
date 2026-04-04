@@ -1,7 +1,7 @@
 (function initUVBackupLogic(globalScope) {
   'use strict';
 
-  const BACKUP_SCOPE_KEYS = ['ownDrafts', 'ownPosts', 'castInPosts', 'castInDrafts', 'characterPosts', 'ownPrompts'];
+  const BACKUP_SCOPE_KEYS = ['ownDrafts', 'ownPosts', 'castInPosts', 'castInDrafts', 'characterPosts', 'ownPrompts', 'characterDrafts'];
   const DEFAULT_BACKUP_SCOPES = Object.freeze({
     ownDrafts: true,
     ownPosts: true,
@@ -9,6 +9,7 @@
     castInDrafts: false,
     characterPosts: false,
     ownPrompts: false,
+    characterDrafts: false,
   });
   const TERMINAL_RUN_STATUSES = new Set(['completed', 'cancelled', 'failed']);
   const RUN_STATUS_VALUES = new Set([
@@ -55,6 +56,7 @@
       castInDrafts: scopes.castInDrafts === true,
       characterPosts: scopes.characterPosts === true,
       ownPrompts: scopes.ownPrompts === true,
+      characterDrafts: scopes.characterDrafts === true,
     };
   }
 
@@ -66,6 +68,7 @@
       castInDrafts: false,
       characterPosts: false,
       ownPrompts: false,
+      characterDrafts: false,
     };
   }
 
@@ -83,11 +86,15 @@
     const headers = {};
     if (!raw || typeof raw !== 'object') return headers;
     const auth = normalizeString(raw.Authorization || raw.authorization);
+    const cookie = normalizeString(raw.Cookie || raw.cookie);
     const device = normalizeString(raw['OAI-Device-Id'] || raw['oai-device-id']);
     const language = normalizeString(raw['OAI-Language'] || raw['oai-language']);
+    const sentinel = normalizeString(raw['OpenAI-Sentinel-Token'] || raw['openai-sentinel-token']);
     if (auth) headers.Authorization = auth;
+    if (cookie) headers.Cookie = cookie;
     if (device) headers['OAI-Device-Id'] = device;
     if (language) headers['OAI-Language'] = language;
+    if (sentinel) headers['OpenAI-Sentinel-Token'] = sentinel;
     return headers;
   }
 
@@ -364,9 +371,11 @@
     const candidates = [];
     const seen = new Set();
     const root = payload?.draft && typeof payload.draft === 'object' ? payload.draft : payload;
-    addCandidate(candidates, seen, root?.encodings?.source?.path, 'no_watermark', 'encodings.source.path', '', 30);
-    addCandidate(candidates, seen, root?.download_urls?.no_watermark, 'no_watermark', 'download_urls.no_watermark', '', 28);
-    addCandidate(candidates, seen, root?.downloadable_url, 'unknown_fallback', 'downloadable_url', '', 18);
+    addCandidate(candidates, seen, root?.download_urls?.no_watermark, 'no_watermark', 'download_urls.no_watermark', '', 30);
+    // Draft encodings.source.path looked like a no-watermark success in earlier manifests,
+    // but the actual files still carried a watermark. Keep this below the shared-link flow.
+    addCandidate(candidates, seen, root?.encodings?.source?.path, 'watermark', 'encodings.source.path', '', 26);
+    addCandidate(candidates, seen, root?.downloadable_url, 'watermark', 'downloadable_url', '', 24);
     addCandidate(candidates, seen, root?.encodings?.source_wm?.path, 'watermark', 'encodings.source_wm.path', '', 24);
     addCandidate(candidates, seen, root?.download_urls?.watermark, 'watermark', 'download_urls.watermark', '', 22);
     walkVideoCandidates(candidates, seen, root?.attachments || [], 'attachments', 0);

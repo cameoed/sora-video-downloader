@@ -11,12 +11,24 @@ const KONTEN_SMART_DOWNLOAD_HEADERS = {
   referer: 'https://kontenai.net/',
   'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36',
 };
-const SORAVDL_PROXY_BASE = 'https://soravdl.com/api/proxy/video/';
 const DEFAULT_DOWNLOAD_HEADERS = {
   'user-agent': 'Sora Video Downloader',
 };
 const REQUEST_BUFFER_TIMEOUT_MS = 15000;
 const DOWNLOAD_SOCKET_TIMEOUT_MS = 20000;
+
+function extractIdFromPermalink(permalink) {
+  const value = String(permalink || '').trim();
+  if (!value) return '';
+  try {
+    const parsed = new URL(value);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    return segments.length ? segments[segments.length - 1] : '';
+  } catch (_error) {
+    const segments = value.split('/').filter(Boolean);
+    return segments.length ? segments[segments.length - 1] : '';
+  }
+}
 
 const SMART_DOWNLOAD_PROVIDERS = [
   {
@@ -40,22 +52,7 @@ const SMART_DOWNLOAD_PROVIDERS = [
       return {
         url: String(downloadUrl),
         headers: {},
-      };
-    },
-  },
-  {
-    id: 'soravdl',
-    async resolve(item) {
-      const itemId = String(item && item.id || '').trim();
-      if (!itemId) throw new Error('smart_download_missing_item_id');
-      return {
-        url: SORAVDL_PROXY_BASE + encodeURIComponent(itemId),
-        headers: {
-          accept: 'video/mp4,video/*;q=0.9,*/*;q=0.8',
-          referer: 'https://jsonpromptgenerator.net/bulk-sora-video-downloader',
-          origin: 'https://jsonpromptgenerator.net',
-        },
-        acceptVideoOnErrorStatus: true,
+        requireVideoContentType: true,
       };
     },
   },
@@ -130,6 +127,18 @@ function isAcceptableVideoResponse(status, headers, requestOptions) {
   return status > 0 && contentType.startsWith('video/');
 }
 
+function getVideoContentType(headers) {
+  return String(headers && headers['content-type'] || '').trim().toLowerCase();
+}
+
+function validateExpectedVideoResponse(headers, requestOptions) {
+  if (!requestOptions || requestOptions.requireVideoContentType !== true) return null;
+  const contentType = getVideoContentType(headers);
+  if (contentType.startsWith('video/')) return null;
+  if (!contentType) return new Error('smart_download_missing_video_content_type');
+  return new Error('smart_download_non_video_response_' + contentType.slice(0, 128));
+}
+
 function downloadToFile(sourceUrl, destinationPath, options, redirectCount) {
   const requestOptions = typeof options === 'object' && options ? options : {};
   const redirects = typeof options === 'number' ? Number(options) || 0 : (Number(redirectCount) || 0);
@@ -194,6 +203,13 @@ function downloadToFile(sourceUrl, destinationPath, options, redirectCount) {
           }
         }
 
+        const videoResponseError = validateExpectedVideoResponse(response.headers, requestOptions);
+        if (videoResponseError) {
+          response.resume();
+          settleFailure(videoResponseError);
+          return;
+        }
+
         try {
           await ensureDir(path.dirname(destinationPath));
         } catch (error) {
@@ -244,6 +260,7 @@ async function resolveSmartDownloadRequest(providerId, item, options) {
     url: url,
     headers: resolved && resolved.headers && typeof resolved.headers === 'object' ? resolved.headers : {},
     acceptVideoOnErrorStatus: !!(resolved && resolved.acceptVideoOnErrorStatus),
+    requireVideoContentType: !!(resolved && resolved.requireVideoContentType),
   };
 }
 

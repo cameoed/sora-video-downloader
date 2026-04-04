@@ -1,12 +1,12 @@
 const fs = require('fs');
 const path = require('path');
 const EventEmitter = require('events');
-const { randomInt } = require('crypto');
 const { FileStore } = require('./file-store');
 const { PlaywrightSession } = require('./playwright-session');
 const { downloadToFile, getSmartDownloadProviders, resolveSmartDownloadRequest } = require('./http-download');
 const { resolveFfmpegBinary, processVideo, buildIntermediateDownloadPath } = require('./media-processing');
 const {
+  BACKUP_ORIGIN,
   BACKUP_URL_REFRESH_MAX_AGE_MS,
   BACKUP_DOWNLOAD_FOLDER,
   DEFAULT_BACKUP_SCOPES,
@@ -37,17 +37,471 @@ const {
   getBackupItemId,
   makeBackupItemKey,
   buildBackupFolderName,
+  buildPromptExportFilename,
   buildBackupFilename,
   buildBackupManifestItem,
   buildBackupDetailPath,
+  buildBackupPermalink,
+  extractBackupPostIdFromPermalink,
+  isBackupPublishedPostPermalink,
+  extractBackupPublishedPostReference,
   pickPrompt,
   pickPromptSource,
   pickTitle,
   sanitizeString,
+  sanitizeIdToken,
+  getBackupRetryDelayMs,
 } = require('./helpers');
 const WATERMARK_DOWNLOAD_THROTTLE_MS = 3000;
-const COMPLETE_SCAN_BUCKETS = ['ownPosts', 'ownDrafts'];
+const DOWNLOAD_VALIDATION_MIN_VIDEO_BYTES = 500 * 1024;
+const DOWNLOAD_VALIDATION_SNIFF_BYTES = 4096;
+const SCAN_PROGRESS_STALL_TIMEOUT_MS = 60 * 1000;
+const SCAN_PROGRESS_STALL_MAX_ATTEMPTS = 3;
+const SCAN_PROGRESS_STALL_RETRY_DELAY_MS = 2000;
+const DRAFT_LINK_PUBLISH_DAILY_LIMIT = 500;
+const DRAFT_LINK_PUBLISH_THROTTLE_MS = 4000;
+const DRAFT_LINK_PUBLISH_SETTLE_MS = 2000;
+const DRAFT_LINK_PUBLISH_MAX_ATTEMPTS = 3;
+const MAX_DRAFT_LINK_POST_TEXT = 1999;
+const SCAN_RESUME_BUCKET_KEYS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts', 'ownPrompts', 'characterPosts', 'characterDrafts'];
 const PROMPT_SIMILARITY_THRESHOLD = 0.95;
+const DEFAULT_ACCOUNT_STATE_KEY = '__default__';
+const DRAFT_SHARED_LINK_CATALOG_VERSION = 1;
+
+function formatLocalDateKey(value) {
+  const date = value instanceof Date ? value : new Date(value || Date.now());
+  const year = String(date.getFullYear());
+  const month = String(date.getMonth() + 1).padStart(2, '0');
+  const day = String(date.getDate()).padStart(2, '0');
+  return year + '-' + month + '-' + day;
+}
+
+function createEmptyDraftPublishUsage() {
+  return {
+    date: '',
+    count: 0,
+    last_published_at: 0,
+  };
+}
+
+function normalizeDraftPublishUsage(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = createEmptyDraftPublishUsage();
+  normalized.date = sanitizeString(source.date, 32) || '';
+  normalized.count = Math.max(0, Math.floor(Number(source.count) || 0));
+  normalized.last_published_at = Math.max(0, Math.floor(Number(source.last_published_at) || 0));
+  return normalized;
+}
+
+function ensureCurrentDraftPublishUsage(raw) {
+  const normalized = normalizeDraftPublishUsage(raw);
+  const today = formatLocalDateKey();
+  if (normalized.date === today) return normalized;
+  return {
+    date: today,
+    count: 0,
+    last_published_at: 0,
+  };
+}
+
+function buildDraftPublishUsageSnapshot(raw) {
+  const usage = ensureCurrentDraftPublishUsage(raw);
+  return {
+    date: usage.date,
+    count: usage.count,
+    limit: DRAFT_LINK_PUBLISH_DAILY_LIMIT,
+    remaining: Math.max(0, DRAFT_LINK_PUBLISH_DAILY_LIMIT - usage.count),
+  };
+}
+
+function truncateDraftLinkPostText(value) {
+  const text = sanitizeString(value, 8192) || '';
+  if (!text || text.length <= MAX_DRAFT_LINK_POST_TEXT) return text;
+  const suffix = '...';
+  const limit = MAX_DRAFT_LINK_POST_TEXT - suffix.length;
+  const cut = text.slice(0, limit);
+  const lastSpace = cut.lastIndexOf(' ');
+  const trimmed = lastSpace > Math.floor(limit * 0.6) ? cut.slice(0, lastSpace) : cut;
+  return trimmed.trimEnd() + suffix;
+}
+
+function buildDirectDraftSharedLinkPostBody(detail, item) {
+  const draft = detail && typeof detail.draft === 'object' ? detail.draft : detail;
+  if (!draft || typeof draft !== 'object') return null;
+  const draftId = sanitizeString(draft.id, 256) || sanitizeString(item && item.id, 256) || '';
+  const itemKind = sanitizeString(item && item.draft_source_kind, 64) || '';
+  const kind = itemKind || sanitizeString(draft.kind, 64) || '';
+  const isEditDraft = kind === 'sora_edit' || (!kind && Array.isArray(draft.assets) && draft.assets.length > 0);
+  const itemGenerationId = sanitizeString(item && item.draft_generation_id, 256) || '';
+
+  let generationId = '';
+  let attachmentKind = '';
+  let postText = '';
+  if (kind === 'sora_draft') {
+    generationId = itemGenerationId || sanitizeString(draft.generation_id, 256) || draftId;
+    attachmentKind = 'sora';
+    postText =
+      sanitizeString(draft.prompt, 8192) ||
+      sanitizeString(draft.title, 512) ||
+      sanitizeString(item && item.prompt, 8192) ||
+      '';
+  } else if (isEditDraft) {
+    generationId = itemGenerationId || draftId;
+    attachmentKind = 'sora_edit';
+    postText =
+      sanitizeString(draft.caption, 8192) ||
+      sanitizeString(draft.prompt, 8192) ||
+      sanitizeString(item && item.prompt, 8192) ||
+      '';
+  } else {
+    return null;
+  }
+
+  if (!generationId || !attachmentKind) return null;
+  return {
+    attachments_to_create: [{ generation_id: generationId, kind: attachmentKind }],
+    post_text: truncateDraftLinkPostText(postText || 'Downloaded!'),
+    destinations: [{ type: 'shared_link_unlisted' }],
+  };
+}
+
+function buildDraftPublishFallbackDetail(item) {
+  if (!item || typeof item !== 'object') return null;
+  const draftId = sanitizeIdToken(item.id, 256) || '';
+  const generationId = sanitizeIdToken(item.draft_generation_id, 256) || draftId;
+  const kind = sanitizeString(item.draft_source_kind, 64) || 'sora_draft';
+  const nFrames = Math.max(0, Math.floor(Number(item.draft_n_frames) || 0));
+  if (!draftId || !generationId) return null;
+  return {
+    draft: {
+      id: draftId,
+      kind,
+      generation_id: generationId,
+      prompt: sanitizeString(item.prompt, 8192) || '',
+      title: sanitizeString(item.title, 512) || '',
+      caption: '',
+      duration_s: Number(item.duration_s) || 0,
+      creation_config: nFrames > 0 ? { n_frames: nFrames } : {},
+      n_frames: nFrames,
+    },
+  };
+}
+
+function isTemporaryEditorDraftArtifact(value) {
+  const item = value && typeof value === 'object' ? value : {};
+  if (
+    Array.isArray(item.assets) &&
+    Array.isArray(item.timeline) &&
+    item.preview_asset &&
+    typeof item.preview_asset === 'object'
+  ) {
+    return true;
+  }
+  const kind = sanitizeString(item.kind, 64) || '';
+  const generationType = sanitizeString(item.generation_type, 128) || '';
+  const title = sanitizeString(item.title, 512) || '';
+  const prompt = sanitizeString(item.prompt, 8192) || '';
+  return (
+    kind === 'sora_draft' &&
+    generationType === 'editor_stitch' &&
+    title === 'Your new editor export' &&
+    !prompt
+  );
+}
+
+function normalizeManualBearerToken(value) {
+  const raw = sanitizeString(value, 16384) || '';
+  if (!raw) return '';
+  const token = raw.replace(/^Authorization\s*:\s*/i, '').replace(/^Bearer\s+/i, '').trim();
+  return token ? ('Bearer ' + token) : '';
+}
+
+function normalizeManualCookieHeader(value) {
+  const raw = sanitizeString(value, 65535) || '';
+  if (!raw) return '';
+  return raw.replace(/^Cookie\s*:\s*/i, '').trim() || '';
+}
+
+function logAuthState(label, { cookieHeader, bearerToken } = {}) {
+  const cookieSummary = summarizeCookieHeader(cookieHeader || '');
+  console.log('[draft-auth]', label, JSON.stringify({
+    cookie_present: !!cookieHeader,
+    cookie_length: (cookieHeader || '').length,
+    cookie_count: cookieSummary.count,
+    cookie_names: cookieSummary.names,
+    bearer_present: !!(bearerToken),
+    bearer_length: (bearerToken || '').length,
+  }));
+}
+
+function summarizeCookieHeader(value) {
+  const raw = sanitizeString(value, 65535) || '';
+  if (!raw) return { present: false, count: 0, names: [] };
+  const names = raw
+    .split(';')
+    .map((part) => {
+      const chunk = String(part || '').trim();
+      if (!chunk) return '';
+      const eqIndex = chunk.indexOf('=');
+      return eqIndex > 0 ? chunk.slice(0, eqIndex).trim() : '';
+    })
+    .filter(Boolean);
+  return {
+    present: names.length > 0,
+    count: names.length,
+    names: names.slice(0, 64),
+  };
+}
+
+function hasReadyDraftSharedLink(item) {
+  if (!item || item.kind !== 'draft') return false;
+  return isBackupPublishedPostPermalink(item.post_permalink);
+}
+
+function backupRequiresManualDraftCookie(scopes, settings) {
+  const normalizedScopes = normalizeBackupScopes(scopes || DEFAULT_BACKUP_SCOPES);
+  const normalizedSettings = normalizeBackupRequestSettings(settings || {});
+  const isDraftScope = normalizedScopes.ownDrafts === true || normalizedScopes.castInDrafts === true || normalizedScopes.characterDrafts === true;
+  return isDraftScope && normalizedSettings.published_download_mode === 'smart';
+}
+
+function hasRequiredManualDraftAuth(settings) {
+  const source = settings && typeof settings === 'object' ? settings : {};
+  return (
+    !!normalizeManualCookieHeader(source.manual_cookie_header) &&
+    !!normalizeManualBearerToken(source.manual_bearer_token)
+  );
+}
+
+function buildPublicSettings(settings) {
+  const next = Object.assign({}, settings || {});
+  next.has_manual_bearer_token = !!normalizeManualBearerToken(next.manual_bearer_token);
+  next.has_manual_cookie_header = !!normalizeManualCookieHeader(next.manual_cookie_header);
+  delete next.download_dir_mode;
+  delete next.profile;
+  delete next.manual_bearer_token;
+  delete next.manual_cookie_header;
+  return next;
+}
+
+function migrateDownloadDirToRoot(downloadDir) {
+  const normalized = sanitizeString(downloadDir, 4096) || '';
+  if (!normalized) return '';
+  if (path.basename(normalized).toLowerCase() === BACKUP_DOWNLOAD_FOLDER.toLowerCase()) {
+    return normalized;
+  }
+  return path.join(normalized, BACKUP_DOWNLOAD_FOLDER);
+}
+
+function sanitizeAccountKeyPart(value) {
+  const raw = sanitizeString(value, 256) || '';
+  return raw.replace(/[^a-z0-9_.:-]/gi, '_');
+}
+
+function buildAccountStateKey(user) {
+  const normalizedUser = normalizeCurrentUser(user || {});
+  if (normalizedUser.id) return 'id:' + sanitizeAccountKeyPart(normalizedUser.id);
+  if (normalizedUser.handle) return 'handle:' + sanitizeAccountKeyPart(String(normalizedUser.handle).toLowerCase());
+  return DEFAULT_ACCOUNT_STATE_KEY;
+}
+
+function sameNormalizedBearerToken(left, right) {
+  return normalizeManualBearerToken(left) === normalizeManualBearerToken(right);
+}
+
+function createEmptyScopedAccountState() {
+  return {
+    lastRunId: '',
+    bucketCatalog: createEmptyBackupBucketCatalog(),
+    savedCatalog: createEmptyBackupBucketCatalog(),
+    cacheResetCatalog: createEmptyCacheResetCatalog(),
+    completeScanCatalog: createEmptyCompleteScanCatalog(),
+    draftPublishUsage: createEmptyDraftPublishUsage(),
+    draftSharedLinkCatalog: createEmptyDraftSharedLinkCatalog(),
+    draftSharedLinkCatalogVersion: 0,
+    scanResumeCatalog: createEmptyScanResumeCatalog(),
+    savedCatalogHydrated: false,
+  };
+}
+
+function normalizeScopedAccountState(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const scanResumeCatalog = mergeLegacyDraftResumeCatalog(
+    normalizeScanResumeCatalog(source.scanResumeCatalog || createEmptyScanResumeCatalog()),
+    source.draftResumeCatalog
+  );
+  return {
+    lastRunId: sanitizeString(source.lastRunId, 128) || '',
+    bucketCatalog: normalizeBackupBucketCatalog(source.bucketCatalog || createEmptyBackupBucketCatalog()),
+    savedCatalog: normalizeBackupBucketCatalog(source.savedCatalog || createEmptyBackupBucketCatalog()),
+    cacheResetCatalog: normalizeCacheResetCatalog(source.cacheResetCatalog),
+    completeScanCatalog: normalizeCompleteScanCatalog(source.completeScanCatalog),
+    draftPublishUsage: ensureCurrentDraftPublishUsage(source.draftPublishUsage),
+    draftSharedLinkCatalog: normalizeDraftSharedLinkCatalog(source.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog()),
+    draftSharedLinkCatalogVersion: Math.max(0, Math.floor(Number(source.draftSharedLinkCatalogVersion) || 0)),
+    scanResumeCatalog: scanResumeCatalog,
+    savedCatalogHydrated: source.savedCatalogHydrated === true,
+  };
+}
+
+function normalizeAccountStatesCatalog(raw, legacyState, legacyAccountKey) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = {};
+  Object.keys(source).forEach((key) => {
+    const normalizedKey = sanitizeString(key, 256) || '';
+    if (!normalizedKey) return;
+    normalized[normalizedKey] = normalizeScopedAccountState(source[key]);
+  });
+
+  const hasLegacyState =
+    !!sanitizeString(legacyState && legacyState.lastRunId, 128) ||
+    !!(legacyState && legacyState.bucketCatalog) ||
+    !!(legacyState && legacyState.savedCatalog) ||
+    !!(legacyState && legacyState.cacheResetCatalog) ||
+    !!(legacyState && legacyState.completeScanCatalog) ||
+    !!(legacyState && legacyState.draftPublishUsage) ||
+    !!(legacyState && legacyState.draftSharedLinkCatalog) ||
+    !!(legacyState && (legacyState.scanResumeCatalog || legacyState.draftResumeCatalog));
+
+  if (hasLegacyState && !Object.keys(normalized).length) {
+    const targetKey = sanitizeString(legacyAccountKey, 256) || DEFAULT_ACCOUNT_STATE_KEY;
+    normalized[targetKey] = normalizeScopedAccountState({
+      lastRunId: legacyState.lastRunId,
+      bucketCatalog: legacyState.bucketCatalog,
+      savedCatalog: legacyState.savedCatalog,
+      cacheResetCatalog: legacyState.cacheResetCatalog,
+      completeScanCatalog: legacyState.completeScanCatalog,
+      draftPublishUsage: legacyState.draftPublishUsage,
+      draftSharedLinkCatalog: legacyState.draftSharedLinkCatalog,
+      scanResumeCatalog: legacyState.scanResumeCatalog,
+      draftResumeCatalog: legacyState.draftResumeCatalog,
+      savedCatalogHydrated: true,
+    });
+  }
+
+  if (!Object.keys(normalized).length) {
+    normalized[DEFAULT_ACCOUNT_STATE_KEY] = createEmptyScopedAccountState();
+  }
+
+  return normalized;
+}
+
+function normalizeStoredSession(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  return {
+    authenticated: source.authenticated === true,
+    checkedAt: Math.max(0, Math.floor(Number(source.checkedAt) || 0)),
+    user: source.user ? normalizeCurrentUser(source.user) : null,
+    status: Math.max(0, Math.floor(Number(source.status) || 0)),
+    error: sanitizeString(source.error, 1024) || '',
+  };
+}
+
+function createEmptyScanResumeCatalog() {
+  return {
+    ownPosts: null,
+    ownDrafts: null,
+    castInPosts: null,
+    castInDrafts: null,
+    ownPrompts: null,
+    characterPosts: {},
+    characterDrafts: {},
+  };
+}
+
+function createEmptyDraftSharedLinkCatalog() {
+  return {};
+}
+
+function normalizeDraftSharedLinkEntry(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const permalink = isBackupPublishedPostPermalink(source.permalink)
+    ? source.permalink
+    : '';
+  const postId = sanitizeIdToken(
+    source.postId || extractBackupPostIdFromPermalink(permalink),
+    256
+  ) || '';
+  const normalizedPermalink = permalink || (
+    /^s_[A-Za-z0-9]+$/i.test(postId)
+      ? buildBackupPermalink('published', postId)
+      : ''
+  );
+  if (!normalizedPermalink) return null;
+  return {
+    permalink: normalizedPermalink,
+    postId: postId || extractBackupPostIdFromPermalink(normalizedPermalink),
+    updatedAt: Math.max(0, Math.floor(Number(source.updatedAt) || 0)),
+  };
+}
+
+function normalizeDraftSharedLinkCatalog(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = createEmptyDraftSharedLinkCatalog();
+  Object.keys(source).forEach((draftId) => {
+    const normalizedDraftId = sanitizeIdToken(draftId, 256) || '';
+    const entry = normalizeDraftSharedLinkEntry(source[draftId]);
+    if (!normalizedDraftId || !entry) return;
+    normalized[normalizedDraftId] = entry;
+  });
+  return normalized;
+}
+
+function normalizeScanResumeEntry(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const runId = sanitizeString(raw.runId, 64) || '';
+  if (!runId) return null;
+  const nextCursor = raw.nextCursor == null ? null : String(raw.nextCursor);
+  const updatedAt = Math.max(0, Math.floor(Number(raw.updatedAt) || 0));
+  return {
+    runId: runId,
+    nextCursor: nextCursor && nextCursor.trim() ? nextCursor : null,
+    updatedAt: updatedAt,
+  };
+}
+
+function normalizeScanResumeCatalog(raw) {
+  const source = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
+  const normalized = createEmptyScanResumeCatalog();
+  normalized.ownPosts = normalizeScanResumeEntry(source.ownPosts);
+  normalized.ownDrafts = normalizeScanResumeEntry(source.ownDrafts);
+  normalized.castInPosts = normalizeScanResumeEntry(source.castInPosts);
+  normalized.castInDrafts = normalizeScanResumeEntry(source.castInDrafts);
+  normalized.ownPrompts = normalizeScanResumeEntry(source.ownPrompts);
+  const rawCharacters = source.characterPosts && typeof source.characterPosts === 'object' && !Array.isArray(source.characterPosts)
+    ? source.characterPosts
+    : {};
+  Object.keys(rawCharacters).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    const entry = normalizeScanResumeEntry(rawCharacters[handle]);
+    if (!normalizedHandle || !entry) return;
+    normalized.characterPosts[normalizedHandle] = entry;
+  });
+  const rawCharDrafts = source.characterDrafts && typeof source.characterDrafts === 'object' && !Array.isArray(source.characterDrafts)
+    ? source.characterDrafts
+    : {};
+  Object.keys(rawCharDrafts).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    const entry = normalizeScanResumeEntry(rawCharDrafts[handle]);
+    if (!normalizedHandle || !entry) return;
+    normalized.characterDrafts[normalizedHandle] = entry;
+  });
+  return normalized;
+}
+
+function mergeLegacyDraftResumeCatalog(targetCatalog, rawLegacyCatalog) {
+  const target = normalizeScanResumeCatalog(targetCatalog || createEmptyScanResumeCatalog());
+  const source = rawLegacyCatalog && typeof rawLegacyCatalog === 'object' && !Array.isArray(rawLegacyCatalog)
+    ? rawLegacyCatalog
+    : {};
+  if (!target.ownDrafts) target.ownDrafts = normalizeScanResumeEntry(source.ownDrafts);
+  if (!target.castInDrafts) target.castInDrafts = normalizeScanResumeEntry(source.castInDrafts);
+  return target;
+}
+
+function isScanResumeBucketKey(value) {
+  return SCAN_RESUME_BUCKET_KEYS.indexOf(String(value || '')) >= 0;
+}
 
 function normalizePromptForDisplay(value) {
   return sanitizeString(String(value || '').replace(/\s+/g, ' '), 8192) || '';
@@ -142,7 +596,14 @@ function buildPromptCsv(rows) {
 }
 
 function createEmptyCompleteScanCatalog() {
-  return { ownPosts: null, ownDrafts: null };
+  return {
+    ownPosts: null,
+    ownDrafts: null,
+    castInPosts: null,
+    castInDrafts: null,
+    characterPosts: {},
+    characterDrafts: {},
+  };
 }
 
 function normalizeCompleteScanEntry(raw) {
@@ -157,10 +618,30 @@ function normalizeCompleteScanEntry(raw) {
 
 function normalizeCompleteScanCatalog(raw) {
   const source = raw && typeof raw === 'object' ? raw : {};
-  return {
-    ownPosts: normalizeCompleteScanEntry(source.ownPosts),
-    ownDrafts: normalizeCompleteScanEntry(source.ownDrafts),
-  };
+  const normalized = createEmptyCompleteScanCatalog();
+  normalized.ownPosts = normalizeCompleteScanEntry(source.ownPosts);
+  normalized.ownDrafts = normalizeCompleteScanEntry(source.ownDrafts);
+  normalized.castInPosts = normalizeCompleteScanEntry(source.castInPosts);
+  normalized.castInDrafts = normalizeCompleteScanEntry(source.castInDrafts);
+  const rawCharacters = source.characterPosts && typeof source.characterPosts === 'object' && !Array.isArray(source.characterPosts)
+    ? source.characterPosts
+    : {};
+  Object.keys(rawCharacters).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    const entry = normalizeCompleteScanEntry(rawCharacters[handle]);
+    if (!normalizedHandle || !entry) return;
+    normalized.characterPosts[normalizedHandle] = entry;
+  });
+  const rawCharDrafts = source.characterDrafts && typeof source.characterDrafts === 'object' && !Array.isArray(source.characterDrafts)
+    ? source.characterDrafts
+    : {};
+  Object.keys(rawCharDrafts).forEach((handle) => {
+    const normalizedHandle = normalizeCharacterHandle(handle);
+    const entry = normalizeCompleteScanEntry(rawCharDrafts[handle]);
+    if (!normalizedHandle || !entry) return;
+    normalized.characterDrafts[normalizedHandle] = entry;
+  });
+  return normalized;
 }
 const VIDEO_PROCESS_RETRY_COUNT = 2;
 const CLEARABLE_CACHE_BUCKETS = ['ownPosts', 'ownDrafts', 'castInPosts', 'castInDrafts'];
@@ -213,7 +694,80 @@ class BackupCancelledError extends Error {
   }
 }
 
-const SMART_DOWNLOAD_OVERLOADED_MESSAGE = 'All watermark removers are overloaded right now. Please try again later.';
+const SMART_DOWNLOAD_OVERLOADED_MESSAGE = "All watermark removers are overloaded right now. Retrying every 3 mins until one comes online!";
+const SMART_DOWNLOAD_OVERLOAD_RETRY_MS = 3 * 60 * 1000;
+
+function normalizeDownloadMediaExt(value) {
+  return String(value || '').trim().replace(/[^A-Za-z0-9]/g, '').toLowerCase();
+}
+
+function hasIsoBmffSignature(buffer) {
+  return !!(buffer && buffer.length >= 12 && buffer.toString('ascii', 4, 8) === 'ftyp');
+}
+
+function hasWebmSignature(buffer) {
+  return !!(
+    buffer &&
+    buffer.length >= 4 &&
+    buffer[0] === 0x1a &&
+    buffer[1] === 0x45 &&
+    buffer[2] === 0xdf &&
+    buffer[3] === 0xa3
+  );
+}
+
+function hasKnownVideoSignature(buffer, mediaExt) {
+  const normalizedExt = normalizeDownloadMediaExt(mediaExt);
+  if (normalizedExt === 'webm') return hasWebmSignature(buffer);
+  if (normalizedExt === 'mp4' || normalizedExt === 'm4v' || normalizedExt === 'mov') {
+    return hasIsoBmffSignature(buffer);
+  }
+  return hasIsoBmffSignature(buffer) || hasWebmSignature(buffer);
+}
+
+function looksLikeHtmlDocument(buffer) {
+  if (!buffer || !buffer.length) return false;
+  const prefix = buffer
+    .toString('utf8', 0, Math.min(buffer.length, DOWNLOAD_VALIDATION_SNIFF_BYTES))
+    .replace(/^\uFEFF/, '')
+    .trimStart()
+    .slice(0, 512)
+    .toLowerCase();
+  if (!prefix.startsWith('<')) return false;
+  if (/^<(?:!doctype\s+html|html|head|body)\b/.test(prefix)) return true;
+  return prefix.includes('<html') && (prefix.includes('<head') || prefix.includes('<body'));
+}
+
+function formatDownloadSizeLabel(size) {
+  const sizeKb = Math.max(0, Math.round((Number(size) || 0) / 1024));
+  return sizeKb + ' KB';
+}
+
+async function readFileHeader(filePath, byteCount) {
+  const targetBytes = Math.max(0, Math.floor(Number(byteCount) || 0));
+  if (!targetBytes) return Buffer.alloc(0);
+  const file = await fs.promises.open(filePath, 'r');
+  try {
+    const buffer = Buffer.alloc(targetBytes);
+    const { bytesRead } = await file.read(buffer, 0, targetBytes, 0);
+    return bytesRead < targetBytes ? buffer.slice(0, bytesRead) : buffer;
+  } finally {
+    await file.close().catch(() => {});
+  }
+}
+
+function formatSmartDownloadOverloadedMessage(value) {
+  const timestamp = new Date(value || Date.now()).toLocaleTimeString('en-US', {
+    hour: 'numeric',
+    minute: '2-digit',
+  });
+  return '[' + timestamp + '] ' + SMART_DOWNLOAD_OVERLOADED_MESSAGE;
+}
+
+function isSmartDownloadOverloadedMessage(value) {
+  const message = sanitizeString(String(value || ''), 2048) || '';
+  return message.replace(/^\[[^\]]+\]\s*/, '') === SMART_DOWNLOAD_OVERLOADED_MESSAGE;
+}
 
 class BackupService extends EventEmitter {
   constructor(options) {
@@ -228,26 +782,127 @@ class BackupService extends EventEmitter {
     this.ffmpegPath = '';
     this.ffmpegPathPromise = null;
     this.activeAbortController = null;
+    this.sessionManualBearerToken = '';
   }
 
   async initialize() {
     await this.store.initialize();
     this.state = await this.store.getState();
+    this.state.session = normalizeStoredSession(this.state.session);
     const settings = this.state.settings || {};
-    if (!settings.downloadDir) settings.downloadDir = this.defaultDownloadDir;
+    if (!settings.downloadDir) {
+      settings.downloadDir = this.defaultDownloadDir;
+      settings.download_dir_mode = 'root';
+    } else if (settings.download_dir_mode !== 'root') {
+      settings.downloadDir = migrateDownloadDirToRoot(settings.downloadDir);
+      settings.download_dir_mode = 'root';
+    }
     if (!settings.published_download_mode) settings.published_download_mode = 'smart';
     settings.audio_mode = normalizeBackupAudioMode(settings.audio_mode);
     settings.framing_mode = normalizeBackupFramingMode(settings.framing_mode);
     if (!settings.selectedScope) settings.selectedScope = 'ownPosts';
     if (!settings.character_handle) settings.character_handle = '';
+    if (!settings.character_drafts_handle) settings.character_drafts_handle = '';
+    settings.manual_bearer_token = '';
+    settings.manual_cookie_header = normalizeManualCookieHeader(settings.manual_cookie_header);
     delete settings.profile;
     settings.theme = 'dark';
     this.state.settings = settings;
-    this.state.bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
-    this.state.savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
-    this.state.cacheResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
-    this.state.completeScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
-    await this._hydrateSavedCatalogFromRuns();
+    this._setSessionManualBearerToken('');
+    await this.session.setManualAuth(this._getSessionManualBearerToken(), settings.manual_cookie_header);
+    const legacyAccountKey = buildAccountStateKey(this.state.session && this.state.session.authenticated ? this.state.session.user : null);
+    this.state.accountStates = normalizeAccountStatesCatalog(this.state.accountStates, this.state, legacyAccountKey);
+    const initialAccountKey = this.state.session && this.state.session.authenticated
+      ? (sanitizeString(this.state.activeAccountKey, 256) || legacyAccountKey)
+      : DEFAULT_ACCOUNT_STATE_KEY;
+    this._activateAccountState(initialAccountKey, { persistCurrent: false });
+    await this._hydrateSavedCatalogFromRuns(this._getActiveAccountKey());
+    await this._saveState();
+  }
+
+  _getSessionManualBearerToken() {
+    return normalizeManualBearerToken(this.sessionManualBearerToken);
+  }
+
+  _setSessionManualBearerToken(value) {
+    this.sessionManualBearerToken = normalizeManualBearerToken(value);
+    return this.sessionManualBearerToken;
+  }
+
+  _buildPublicSettings() {
+    return buildPublicSettings(Object.assign({}, this.state.settings, {
+      manual_bearer_token: this._getSessionManualBearerToken(),
+    }));
+  }
+
+  _getActiveManualDraftAuth() {
+    return {
+      manualBearerToken: this._getSessionManualBearerToken(),
+      manualCookieHeader: normalizeManualCookieHeader(
+        this.state && this.state.settings && this.state.settings.manual_cookie_header
+      ),
+    };
+  }
+
+  _getActiveAccountKey() {
+    return sanitizeString(this.state && this.state.activeAccountKey, 256) || DEFAULT_ACCOUNT_STATE_KEY;
+  }
+
+  _ensureAccountStatesCatalog() {
+    if (!this.state) return {};
+    const legacyAccountKey = buildAccountStateKey(this.state.session && this.state.session.authenticated ? this.state.session.user : null);
+    this.state.accountStates = normalizeAccountStatesCatalog(this.state.accountStates, this.state, legacyAccountKey);
+    return this.state.accountStates;
+  }
+
+  _ensureScopedAccountState(accountKey) {
+    const key = sanitizeString(accountKey, 256) || DEFAULT_ACCOUNT_STATE_KEY;
+    const catalog = this._ensureAccountStatesCatalog();
+    catalog[key] = normalizeScopedAccountState(catalog[key] || createEmptyScopedAccountState());
+    return catalog[key];
+  }
+
+  _persistCurrentAccountState() {
+    if (!this.state) return;
+    const key = this._getActiveAccountKey();
+    const scoped = this._ensureScopedAccountState(key);
+    scoped.lastRunId = sanitizeString(this.state.lastRunId, 128) || '';
+    scoped.bucketCatalog = normalizeBackupBucketCatalog(this.state.bucketCatalog || createEmptyBackupBucketCatalog());
+    scoped.savedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
+    scoped.cacheResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
+    scoped.completeScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
+    scoped.draftPublishUsage = ensureCurrentDraftPublishUsage(this.state.draftPublishUsage);
+    scoped.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(this.state.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
+    scoped.draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(this.state.draftSharedLinkCatalogVersion) || 0));
+    scoped.scanResumeCatalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
+    scoped.savedCatalogHydrated = scoped.savedCatalogHydrated === true;
+  }
+
+  _loadAccountStateToRoot(accountKey) {
+    const key = sanitizeString(accountKey, 256) || DEFAULT_ACCOUNT_STATE_KEY;
+    const scoped = this._ensureScopedAccountState(key);
+    this.state.activeAccountKey = key;
+    this.state.lastRunId = scoped.lastRunId || '';
+    this.state.bucketCatalog = normalizeBackupBucketCatalog(scoped.bucketCatalog || createEmptyBackupBucketCatalog());
+    this.state.savedCatalog = normalizeBackupBucketCatalog(scoped.savedCatalog || createEmptyBackupBucketCatalog());
+    this.state.cacheResetCatalog = normalizeCacheResetCatalog(scoped.cacheResetCatalog);
+    this.state.completeScanCatalog = normalizeCompleteScanCatalog(scoped.completeScanCatalog);
+    this.state.draftPublishUsage = ensureCurrentDraftPublishUsage(scoped.draftPublishUsage);
+    this.state.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(scoped.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
+    this.state.draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(scoped.draftSharedLinkCatalogVersion) || 0));
+    this.state.scanResumeCatalog = normalizeScanResumeCatalog(scoped.scanResumeCatalog || createEmptyScanResumeCatalog());
+  }
+
+  _activateAccountState(accountKey, options) {
+    const settings = options && typeof options === 'object' ? options : {};
+    if (settings.persistCurrent !== false) {
+      this._persistCurrentAccountState();
+    }
+    this._loadAccountStateToRoot(accountKey);
+  }
+
+  async _saveState() {
+    this._persistCurrentAccountState();
     await this.store.saveState(this.state);
   }
 
@@ -270,10 +925,11 @@ class BackupService extends EventEmitter {
         ? await this.store.getItems(lastRunId)
         : [];
     return {
-      settings: Object.assign({}, this.state.settings),
+      settings: this._buildPublicSettings(),
       session: Object.assign({ authenticated: false, checkedAt: 0, user: null }, this.state.session || {}),
       run: run,
       bucket_progress: this._buildBucketProgressSnapshot(run, items || [], this.state.settings),
+      draft_publish_usage: buildDraftPublishUsageSnapshot(this.state.draftPublishUsage),
     };
   }
 
@@ -287,12 +943,26 @@ class BackupService extends EventEmitter {
   async _resetStaleRunForBootstrap(runRecord) {
     if (!runRecord || isTerminalRunStatus(runRecord.status)) return;
     const now = Date.now();
+    const staleItems = await this.store.getItems(runRecord.id);
+    let itemsChanged = false;
+    const normalizedItems = Array.isArray(staleItems)
+      ? staleItems.map((item) => {
+        if (normalizeItemStatus(item && item.status) !== 'downloading') return item;
+        itemsChanged = true;
+        return Object.assign({}, item, {
+          status: 'queued',
+        });
+      })
+      : [];
     runRecord.status = 'cancelled';
     runRecord.cancelled_at = now;
     runRecord.updated_at = now;
     runRecord.active_item_key = '';
     runRecord.summary_text = 'Backup cancelled.';
     await this.store.saveRun(runRecord);
+    if (itemsChanged) {
+      await this.store.saveItems(runRecord.id, normalizedItems);
+    }
   }
 
   async clearSelectedCaches(payload) {
@@ -325,6 +995,7 @@ class BackupService extends EventEmitter {
     const nextSavedCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
     const nextResetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
     const nextCompleteScanCatalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog);
+    const nextScanResumeCatalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
     const resetAt = Date.now();
 
     for (let index = 0; index < modes.length; index += 1) {
@@ -335,12 +1006,17 @@ class BackupService extends EventEmitter {
       if (Object.prototype.hasOwnProperty.call(nextCompleteScanCatalog, bucketKey)) {
         nextCompleteScanCatalog[bucketKey] = null;
       }
+      if (Object.prototype.hasOwnProperty.call(nextScanResumeCatalog, bucketKey)) {
+        nextScanResumeCatalog[bucketKey] = null;
+      }
     }
 
     for (let index = 0; index < characters.length; index += 1) {
       const handle = characters[index];
       delete nextBucketCatalog.characterPosts[handle];
       delete nextSavedCatalog.characterPosts[handle];
+      delete nextCompleteScanCatalog.characterPosts[handle];
+      delete nextScanResumeCatalog.characterPosts[handle];
       nextResetCatalog.characterPosts[handle] = resetAt;
     }
 
@@ -348,7 +1024,8 @@ class BackupService extends EventEmitter {
     this.state.savedCatalog = nextSavedCatalog;
     this.state.cacheResetCatalog = nextResetCatalog;
     this.state.completeScanCatalog = nextCompleteScanCatalog;
-    await this.store.saveState(this.state);
+    this.state.scanResumeCatalog = nextScanResumeCatalog;
+    await this._saveState();
     const bootstrap = await this.getBootstrap();
     bootstrap.bucket_progress = this._buildBucketProgressSnapshot(null, [], this.state.settings);
 
@@ -367,10 +1044,28 @@ class BackupService extends EventEmitter {
     const nextSettings = Object.assign({}, this.state.settings, partial || {});
     nextSettings.audio_mode = normalizeBackupAudioMode(nextSettings.audio_mode);
     nextSettings.framing_mode = normalizeBackupFramingMode(nextSettings.framing_mode);
+    nextSettings.download_dir_mode = 'root';
+    const nextManualBearerToken = normalizeManualBearerToken(
+      Object.prototype.hasOwnProperty.call(partial || {}, 'manual_bearer_token')
+        ? (partial || {}).manual_bearer_token
+        : this._getSessionManualBearerToken()
+    );
+    nextSettings.manual_cookie_header = normalizeManualCookieHeader(
+      Object.prototype.hasOwnProperty.call(nextSettings, 'manual_cookie_header')
+        ? nextSettings.manual_cookie_header
+        : this.state.settings.manual_cookie_header
+    );
+    nextSettings.manual_bearer_token = '';
     delete nextSettings.profile;
     this.state.settings = nextSettings;
-    await this.store.saveState(this.state);
-    return this.state.settings;
+    this._setSessionManualBearerToken(nextManualBearerToken);
+    await this.session.setManualAuth(this._getSessionManualBearerToken(), nextSettings.manual_cookie_header);
+    logAuthState('updateSettings saved', {
+      cookieHeader: nextSettings.manual_cookie_header,
+      bearerToken: this._getSessionManualBearerToken(),
+    });
+    await this._saveState();
+    return this._buildPublicSettings();
   }
 
   async openLoginWindow() {
@@ -379,7 +1074,30 @@ class BackupService extends EventEmitter {
   }
 
   async checkSession() {
-    const sessionStatus = await this.session.checkAuth();
+    let sessionStatus = await this.session.checkAuth();
+    const revokedManualBearer =
+      !!this._getSessionManualBearerToken() &&
+      Number(sessionStatus && sessionStatus.status) === 401 &&
+      /token_revoked|invalidated oauth token/i.test(String(sessionStatus && sessionStatus.error || ''));
+    if (revokedManualBearer) {
+      this.state.settings = Object.assign({}, this.state.settings, {
+        manual_bearer_token: '',
+        manual_cookie_header: '',
+      });
+      this._setSessionManualBearerToken('');
+      await this.session.setManualAuth('', '');
+      sessionStatus = await this.session.checkAuth();
+    }
+    if (sessionStatus && sessionStatus.authenticated) {
+      const nextAccountKey = buildAccountStateKey(sessionStatus.user || {});
+      if (nextAccountKey !== this._getActiveAccountKey()) {
+        this._activateAccountState(nextAccountKey);
+      }
+      await this._hydrateSavedCatalogFromRuns(this._getActiveAccountKey());
+      await this.session.close().catch(() => {});
+    } else if (this._getActiveAccountKey() !== DEFAULT_ACCOUNT_STATE_KEY) {
+      this._activateAccountState(DEFAULT_ACCOUNT_STATE_KEY);
+    }
     this.state.session = {
       authenticated: sessionStatus.authenticated === true,
       checkedAt: Date.now(),
@@ -387,8 +1105,91 @@ class BackupService extends EventEmitter {
       status: sessionStatus.status || 0,
       error: sessionStatus.error || '',
     };
-    await this.store.saveState(this.state);
-    return { ok: true, session: this.state.session };
+    await this._saveState();
+    return { ok: true, session: this.state.session, bootstrap: await this.getBootstrap() };
+  }
+
+  async connectWithBearerToken(value) {
+    const payload = value && typeof value === 'object' && !Array.isArray(value)
+      ? value
+      : { token: value, cookie: '' };
+    const token = normalizeManualBearerToken(payload.token);
+    const cookieHeader = normalizeManualCookieHeader(payload.cookie);
+    if (!token) {
+      return { ok: false, error: 'backup_manual_bearer_missing' };
+    }
+
+    const previousAuthToken = normalizeManualBearerToken(
+      (this.session.getCapturedHeaders && this.session.getCapturedHeaders().Authorization) ||
+      this._getSessionManualBearerToken() ||
+      ''
+    );
+    const wasAuthenticated = !!(this.state && this.state.session && this.state.session.authenticated);
+    const changedAccountToken = wasAuthenticated && previousAuthToken && !sameNormalizedBearerToken(previousAuthToken, token);
+
+    this.state.settings = Object.assign({}, this.state.settings, {
+      manual_bearer_token: '',
+      manual_cookie_header: cookieHeader,
+    });
+    this._setSessionManualBearerToken(token);
+    await this.session.setManualAuth(this._getSessionManualBearerToken(), cookieHeader);
+    await this._saveState();
+
+    const sessionCheck = await this.checkSession();
+    if (sessionCheck && sessionCheck.session && sessionCheck.session.authenticated) {
+      const successMessageParts = [];
+      if (changedAccountToken) {
+        successMessageParts.push('Bearer token accepted! You are now connected to a new account.');
+      }
+      return {
+        ok: true,
+        session: sessionCheck.session,
+        settings: this._buildPublicSettings(),
+        message: successMessageParts.join(' '),
+        bootstrap: sessionCheck.bootstrap || null,
+      };
+    }
+
+    this.state.settings = Object.assign({}, this.state.settings, {
+      manual_bearer_token: '',
+      manual_cookie_header: '',
+    });
+    this._setSessionManualBearerToken('');
+    await this.session.setManualAuth('', '');
+    await this._saveState();
+
+    return {
+      ok: false,
+      error: 'backup_manual_bearer_invalid',
+      session: sessionCheck && sessionCheck.session ? sessionCheck.session : null,
+    };
+  }
+
+  async logoutSession() {
+    if (this.currentJob && !isTerminalRunStatus(this.currentJob.run && this.currentJob.run.status)) {
+      return { ok: false, error: 'backup_run_in_progress', bootstrap: await this.getBootstrap() };
+    }
+    this._activateAccountState(DEFAULT_ACCOUNT_STATE_KEY);
+    this.state.settings = Object.assign({}, this.state.settings, {
+      manual_bearer_token: '',
+      manual_cookie_header: '',
+    });
+    this._setSessionManualBearerToken('');
+    await this.session.clearAuthState();
+    this.state.session = {
+      authenticated: false,
+      checkedAt: Date.now(),
+      user: null,
+      status: 0,
+      error: '',
+    };
+    await this._saveState();
+    return {
+      ok: true,
+      session: this.state.session,
+      settings: this._buildPublicSettings(),
+      bootstrap: await this.getBootstrap(),
+    };
   }
 
   async shutdown() {
@@ -413,12 +1214,27 @@ class BackupService extends EventEmitter {
       audio_mode: settings.audio_mode,
       framing_mode: settings.framing_mode,
       character_handle: settings.character_handle,
+      character_drafts_handle: settings.character_drafts_handle,
       selectedScope: Object.keys(scopes).find((key) => scopes[key] === true) || 'ownPosts',
     });
 
     const sessionCheck = await this.checkSession();
     if (!sessionCheck.session || !sessionCheck.session.authenticated) {
       return { ok: false, error: 'backup_missing_auth_session' };
+    }
+    if (backupRequiresManualDraftCookie(scopes, settings)) {
+      const activeAuth = this._getActiveManualDraftAuth();
+      logAuthState('startBackup auth check', {
+        cookieHeader: activeAuth.manualCookieHeader,
+        bearerToken: activeAuth.manualBearerToken,
+      });
+      if (!hasRequiredManualDraftAuth(Object.assign({}, this.state && this.state.settings, {
+        manual_bearer_token: activeAuth.manualBearerToken,
+        manual_cookie_header: activeAuth.manualCookieHeader,
+      }))) {
+        console.log('[draft-auth] startBackup REJECTED — missing cookie or bearer');
+        return { ok: false, error: 'backup_draft_manual_auth_required' };
+      }
     }
 
     const run = createBackupRunRecord(scopes, settings, settings.downloadDir);
@@ -432,11 +1248,13 @@ class BackupService extends EventEmitter {
       smartDownload: this._createSmartDownloadState(settings.published_download_mode),
       cancelRequested: false,
       dirtyItemWrites: 0,
+      draftPublishCount: 0,
+      lastDraftPublishStartedAt: 0,
     };
 
     this.currentJob = job;
     this.state.lastRunId = run.id;
-    await this.store.saveState(this.state);
+    await this._saveState();
     await this.store.saveRun(run);
     this._emitStatus(job);
 
@@ -492,14 +1310,18 @@ class BackupService extends EventEmitter {
 
   async getRunFolder(runId) {
     const targetRunId = runId || (this.currentJob && this.currentJob.run.id) || this.state.lastRunId;
-    if (!targetRunId) return '';
+    if (!targetRunId) {
+      return path.join(this.state.settings.downloadDir || this.defaultDownloadDir, '__placeholder__');
+    }
     const run = this.currentJob && this.currentJob.run.id === targetRunId
       ? this.currentJob.run
       : await this.store.getRun(targetRunId);
-    if (!run) return '';
+    if (!run) {
+      return path.join(this.state.settings.downloadDir || this.defaultDownloadDir, '__placeholder__');
+    }
     const scopes = normalizeBackupScopes(run.scopes);
     const bucketKey = Object.keys(scopes).find((key) => scopes[key] === true) || 'ownPosts';
-    return path.join(run.download_dir || this.state.settings.downloadDir, BACKUP_DOWNLOAD_FOLDER, buildBackupFolderName(run, bucketKey));
+    return path.join(run.download_dir || this.state.settings.downloadDir, buildBackupFolderName(run, bucketKey));
   }
 
   _isPromptExportRun(run) {
@@ -511,10 +1333,15 @@ class BackupService extends EventEmitter {
     try {
       await this._discover(job);
       if (job.cancelRequested) throw new BackupCancelledError();
+      if (job.draftPublishLimitReached) {
+        await this._finalizeDraftPublishLimitedRun(job);
+        return;
+      }
 
       await this.store.saveItems(job.run.id, job.items);
 
       if (this._isPromptExportRun(job.run)) {
+        this._setRunDiagnostic(job, { phase: 'exporting_prompts', reason: 'Building prompts CSV.' });
         job.run.status = 'running';
         job.run.summary_text = 'Discovery complete. Preparing prompts CSV...';
         job.run.updated_at = Date.now();
@@ -526,7 +1353,13 @@ class BackupService extends EventEmitter {
         job.run.completed_at = Date.now();
         job.run.updated_at = Date.now();
         job.run.active_item_key = '';
-        job.run.summary_text = 'Prompt export complete. ' + promptExport.uniqueCount + ' unique prompts saved, ' + promptExport.skippedCount + ' skipped.';
+        job.run.summary_text =
+          'Prompt export complete. ' +
+          promptExport.uniqueCount +
+          ' unique prompts saved, ' +
+          promptExport.skippedCount +
+          ' skipped.' +
+          this._buildDraftPublishSummarySuffix(job);
         await this._persistJob(job, true);
         await this.store.exportManifest(job.run, job.items, 'manifest');
         await this.store.exportManifest(job.run, job.items, 'failures');
@@ -536,17 +1369,21 @@ class BackupService extends EventEmitter {
       }
 
       if ((Number(job.run.counts.queued) || 0) > 0) {
+        this._setRunDiagnostic(job, { phase: 'downloading_batch', reason: 'Discovery finished. Starting queued downloads.' });
         job.run.status = 'running';
         job.run.summary_text = 'Discovery complete. ' + job.run.counts.queued + ' files queued.';
         job.run.updated_at = Date.now();
-        await this.store.saveRun(job.run);
-        this._emitStatus(job);
         await this._downloadQueuedItems(job);
       }
 
       if (job.cancelRequested) throw new BackupCancelledError();
+      if (job.draftPublishLimitReached) {
+        await this._finalizeDraftPublishLimitedRun(job);
+        return;
+      }
 
       job.run.status = 'completed';
+      this._setRunDiagnostic(job, { phase: 'completed', reason: '' });
       job.run.completed_at = Date.now();
       job.run.updated_at = Date.now();
       job.run.active_item_key = '';
@@ -557,7 +1394,8 @@ class BackupService extends EventEmitter {
         (Number(job.run.counts.failed) || 0) +
         ' failed, ' +
         (Number(job.run.counts.skipped) || 0) +
-        ' skipped.';
+        ' skipped.' +
+        this._buildDraftPublishSummarySuffix(job);
       await this._persistJob(job, true);
       await this.store.exportManifest(job.run, job.items, 'manifest');
       await this.store.exportManifest(job.run, job.items, 'failures');
@@ -566,6 +1404,7 @@ class BackupService extends EventEmitter {
     } catch (error) {
       if (error instanceof BackupCancelledError) {
         job.run.status = 'cancelled';
+        this._setRunDiagnostic(job, { phase: 'cancelled', reason: '' });
         job.run.cancelled_at = Date.now();
         job.run.updated_at = Date.now();
         job.run.active_item_key = '';
@@ -589,93 +1428,167 @@ class BackupService extends EventEmitter {
     for (let bucketIndex = 0; bucketIndex < buckets.length; bucketIndex += 1) {
       const bucket = buckets[bucketIndex];
       this._throwIfCancelled(job);
+      this._setRunDiagnostic(job, {
+        phase: 'scanning',
+        bucket: bucket.key,
+        reason: 'Scanning ' + bucket.key + ' for new items.',
+      });
       job.run.summary_text = 'Discovering ' + bucket.key + '…';
       job.run.updated_at = Date.now();
       await this.store.saveRun(job.run);
       this._emitStatus(job);
 
-      if (COMPLETE_SCAN_BUCKETS.indexOf(bucket.key) >= 0) {
-        const cached = this.state.completeScanCatalog && this.state.completeScanCatalog[bucket.key];
-        if (cached && cached.runId && cached.runId !== job.run.id) {
-          job.run.summary_text = 'Loading cached ' + bucket.key + ' from previous scan…';
-          job.run.updated_at = Date.now();
-          await this.store.saveRun(job.run);
-          this._emitStatus(job);
-          const loaded = await this._loadCachedBucketItems(job, bucket, cached.runId, order);
-          if (loaded > 0) {
-            order += loaded;
-            await this._refreshBucketCatalog(job);
-            job.run.summary_text = 'Loaded ' + loaded + ' cached ' + bucket.key + ' items (skipped re-scan).';
-            job.run.updated_at = Date.now();
-            await this.store.saveRun(job.run);
-            this._emitStatus(job);
-            continue;
+      const resumeEntry = this._getScanResumeEntry(job.run, bucket.key);
+      if (resumeEntry && resumeEntry.runId && resumeEntry.runId !== job.run.id) {
+        this._setRunDiagnostic(job, {
+          phase: 'resuming',
+          bucket: bucket.key,
+          reason: 'Resuming from the last unfinished page.',
+        });
+        job.run.summary_text = 'Resuming ' + bucket.key + ' from the last unfinished page…';
+        job.run.updated_at = Date.now();
+        await this.store.saveRun(job.run);
+        this._emitStatus(job);
+        const loaded = await this._loadCachedBucketItems(job, bucket, resumeEntry.runId, order, { preserveStatus: true });
+        if (loaded > 0) {
+          order += loaded;
+          await this._refreshBucketCatalog(job);
+          await this.store.saveItems(job.run.id, job.items);
+          if (this._shouldDownloadIncrementalBatch(bucket.key)) {
+            await this._downloadIncrementalBatch(job, bucket);
+            if (job.cancelRequested || job.draftPublishLimitReached) return;
           }
         }
       }
 
-      let cursor = null;
+      const completeScanEntry = this._supportsCompleteScanCache(bucket.key)
+        ? this._getCompleteScanEntry(job.run, bucket.key)
+        : null;
+      if (
+        completeScanEntry &&
+        completeScanEntry.runId &&
+        completeScanEntry.runId !== job.run.id &&
+        !(resumeEntry && resumeEntry.runId && resumeEntry.runId !== job.run.id)
+      ) {
+        this._setRunDiagnostic(job, {
+          phase: 'loading_cached',
+          bucket: bucket.key,
+          reason: 'Using locally cached scan results.',
+        });
+        job.run.summary_text = 'Loading cached ' + bucket.key + ' from previous scan…';
+        job.run.updated_at = Date.now();
+        await this.store.saveRun(job.run);
+        this._emitStatus(job);
+        const loaded = await this._loadCachedBucketItems(job, bucket, completeScanEntry.runId, order);
+        if (loaded > 0) {
+          order += loaded;
+          await this._refreshBucketCatalog(job);
+          await this.store.saveItems(job.run.id, job.items);
+          if (this._shouldDownloadIncrementalBatch(bucket.key)) {
+            await this._downloadIncrementalBatch(job, bucket);
+            if (job.cancelRequested || job.draftPublishLimitReached) return;
+          }
+          job.run.summary_text = 'Loaded ' + loaded + ' cached ' + bucket.key + ' items (skipped re-scan).';
+          job.run.updated_at = Date.now();
+          await this.store.saveRun(job.run);
+          this._emitStatus(job);
+          continue;
+        }
+      }
+
+      let cursor = (resumeEntry || {}).nextCursor || null;
       let pageNumber = 0;
       const seenCursors = new Set();
+      if (cursor) seenCursors.add(cursor);
 
       do {
-        this._throwIfCancelled(job);
-        const params = Object.assign({ limit: bucket.limit, cursor: cursor }, bucket.extraParams || {});
-        let json;
-        if (bucket.key === 'characterPosts') {
-          json = await this.session.fetchCharacterPostsJson(bucket.character_handle, params, { signal: this._createActiveAbortSignal() });
-        } else {
-          const response = await this.session.fetchJson(bucket.pathname, params, { signal: this._createActiveAbortSignal() });
-          json = response.json || {};
-        }
-
-        if (!ownPostsFirstPage && bucket.key === 'ownPosts') ownPostsFirstPage = json;
-        if (!(job.run.current_user && (job.run.current_user.handle || job.run.current_user.id))) {
-          job.run.current_user = await this._resolveCurrentUser(ownPostsFirstPage);
-        }
-
-        const items = extractItemsFromPayload(json);
+        let json = null;
         let discoveredInPage = 0;
-        for (let index = 0; index < items.length; index += 1) {
+        await this._runScanPageWithSafeguard(job, bucket, pageNumber + 1, async () => {
           this._throwIfCancelled(job);
-          const listItem = items[index];
-          const id = getBackupItemId(bucket.kind, listItem);
-          if (!id) continue;
-          const dedupeKey = bucket.kind + ':' + id;
-          if (job.seenKeys.has(dedupeKey)) continue;
-          job.seenKeys.add(dedupeKey);
+          const params = Object.assign({ limit: bucket.limit, cursor: cursor }, bucket.extraParams || {});
+          if (bucket.key === 'characterPosts') {
+            json = await this.session.fetchCharacterPostsJson(bucket.character_handle, params, { signal: this._createActiveAbortSignal() });
+          } else if (bucket.key === 'characterDrafts') {
+            json = await this.session.fetchCharacterDraftsJson(bucket.character_drafts_handle, params, { signal: this._createActiveAbortSignal() });
+          } else {
+            const response = await this.session.fetchJson(bucket.pathname, params, { signal: this._createActiveAbortSignal() });
+            json = response.json || {};
+          }
 
-          let detail = null;
-          let owner = extractOwnerIdentity(listItem);
-          if (this._shouldFetchDiscoveryDetail(bucket, owner)) {
-            detail = await this._fetchBackupDetail(bucket.kind, id);
-            owner = extractOwnerIdentity(detail || listItem);
+          if (!ownPostsFirstPage && bucket.key === 'ownPosts') ownPostsFirstPage = json;
+          if (!(job.run.current_user && (job.run.current_user.handle || job.run.current_user.id))) {
+            job.run.current_user = await this._resolveCurrentUser(ownPostsFirstPage);
           }
-          if (this._isAlreadySaved(job, bucket.key, id)) {
-            continue;
+
+          const items = extractItemsFromPayload(json);
+          for (let index = 0; index < items.length; index += 1) {
+            this._throwIfCancelled(job);
+            const listItem = items[index];
+            if (bucket.kind === 'draft' && isTemporaryEditorDraftArtifact(listItem)) {
+              continue;
+            }
+            const id = getBackupItemId(bucket.kind, listItem);
+            if (!id) continue;
+            const dedupeKey = bucket.kind + ':' + id;
+            if (job.seenKeys.has(dedupeKey)) continue;
+            job.seenKeys.add(dedupeKey);
+
+            let detail = null;
+            let owner = extractOwnerIdentity(listItem);
+            if (this._shouldFetchDiscoveryDetail(bucket, owner)) {
+              detail = await this._fetchBackupDetail(bucket.kind, id);
+              owner = extractOwnerIdentity(detail || listItem);
+            }
+            if (this._isAlreadySaved(job, bucket.key, id)) {
+              continue;
+            }
+            const backupItem = buildBackupManifestItem(job.run, bucket.key, bucket.kind, listItem, detail, order);
+            if (!backupItem) continue;
+            order += 1;
+            discoveredInPage += 1;
+            job.items.push(backupItem);
+            job.run.counts.discovered += 1;
+            job.run.bucket_counts[bucket.key] = (Number(job.run.bucket_counts[bucket.key]) || 0) + 1;
+            job.run.counts = applyBackupStatusTransition(job.run.counts, null, backupItem.status);
           }
-          const backupItem = buildBackupManifestItem(job.run, bucket.key, bucket.kind, listItem, detail, order);
-          if (!backupItem) continue;
-          order += 1;
-          discoveredInPage += 1;
-          job.items.push(backupItem);
-          job.run.counts.discovered += 1;
-          job.run.bucket_counts[bucket.key] = (Number(job.run.bucket_counts[bucket.key]) || 0) + 1;
-          job.run.counts = applyBackupStatusTransition(job.run.counts, null, backupItem.status);
-        }
+        });
 
         pageNumber += 1;
         await this._refreshBucketCatalog(job);
+        this._setRunDiagnostic(job, {
+          phase: 'scanning',
+          bucket: bucket.key,
+          reason: 'Page ' + pageNumber + ' scanned. ' + job.run.counts.discovered + ' accepted in this run so far.',
+        });
         job.run.summary_text = 'Discovering ' + bucket.key + ': page ' + pageNumber + ', accepted ' + job.run.counts.discovered;
         job.run.updated_at = Date.now();
         await this.store.saveRun(job.run);
         this._emitStatus(job);
 
-        if (this._shouldDownloadIncrementalBatch(bucket.key) && discoveredInPage > 0) {
-          await this._downloadIncrementalBatch(job, bucket);
+        const nextCursor = extractCursorFromPayload(json);
+        await this.store.saveItems(job.run.id, job.items);
+        if (nextCursor) {
+          await this._setScanResumeEntry(job.run, bucket.key, {
+            runId: job.run.id,
+            nextCursor: nextCursor,
+            updatedAt: Date.now(),
+          });
+        } else {
+          await this._setScanResumeEntry(job.run, bucket.key, null);
+          if (this._supportsCompleteScanCache(bucket.key)) {
+            await this._setCompleteScanEntry(job.run, bucket.key, {
+              runId: job.run.id,
+              completedAt: Date.now(),
+            });
+          }
         }
 
-        const nextCursor = extractCursorFromPayload(json);
+        if (this._shouldDownloadIncrementalBatch(bucket.key) && discoveredInPage > 0) {
+          await this._downloadIncrementalBatch(job, bucket);
+          if (job.cancelRequested || job.draftPublishLimitReached) return;
+        }
+
         if (nextCursor && !seenCursors.has(nextCursor)) {
           seenCursors.add(nextCursor);
           cursor = nextCursor;
@@ -683,17 +1596,13 @@ class BackupService extends EventEmitter {
           cursor = null;
         }
       } while (cursor);
-
-      if (COMPLETE_SCAN_BUCKETS.indexOf(bucket.key) >= 0) {
-        if (!this.state.completeScanCatalog) this.state.completeScanCatalog = createEmptyCompleteScanCatalog();
-        this.state.completeScanCatalog[bucket.key] = { runId: job.run.id, completedAt: Date.now() };
-        await this.store.saveState(this.state);
-      }
     }
   }
 
-  async _loadCachedBucketItems(job, bucket, runId, startOrder) {
+  async _loadCachedBucketItems(job, bucket, runId, startOrder, options) {
     try {
+      const settings = options && typeof options === 'object' ? options : {};
+      const preserveStatus = settings.preserveStatus === true;
       const cachedItems = await this.store.getItems(runId);
       const bucketItems = (cachedItems || []).filter((item) => item && item.bucket === bucket.key);
       if (!bucketItems.length) return 0;
@@ -704,24 +1613,86 @@ class BackupService extends EventEmitter {
         if (job.seenKeys.has(dedupeKey)) continue;
         job.seenKeys.add(dedupeKey);
         if (this._isAlreadySaved(job, bucket.key, source.id)) continue;
+        const previousStatus = normalizeItemStatus(source.status);
+        const nextStatus = preserveStatus && (previousStatus === 'done' || previousStatus === 'failed' || previousStatus === 'skipped')
+          ? previousStatus
+          : 'queued';
         const item = Object.assign({}, source, {
           item_key: makeBackupItemKey(job.run.id, source.kind, source.id),
           run_id: job.run.id,
           order: startOrder + count,
-          status: 'queued',
-          attempts: 0,
-          last_error: '',
+          status: nextStatus,
+          attempts: nextStatus === 'queued' ? 0 : (Number(source.attempts) || 0),
+          last_error: nextStatus === 'queued' ? '' : (source.last_error || ''),
           filename: buildBackupFilename(job.run, source.bucket, source.id, source.media_ext),
         });
         job.items.push(item);
         job.run.counts.discovered += 1;
         job.run.bucket_counts[bucket.key] = (Number(job.run.bucket_counts[bucket.key]) || 0) + 1;
-        job.run.counts = applyBackupStatusTransition(job.run.counts, null, item.status);
+        job.run.counts = applyBackupStatusTransition(job.run.counts, null, nextStatus);
         count += 1;
       }
       return count;
     } catch (_err) {
       return 0;
+    }
+  }
+
+  async _runScanPageWithSafeguard(job, bucket, pageNumber, worker) {
+    const targetPage = Math.max(1, Math.floor(Number(pageNumber) || 1));
+    const bucketKey = sanitizeString(bucket && bucket.key, 64) || 'unknown';
+    const task = typeof worker === 'function' ? worker : async () => {};
+
+    for (let attempt = 1; attempt <= SCAN_PROGRESS_STALL_MAX_ATTEMPTS; attempt += 1) {
+      let timeoutId = null;
+      let timedOut = false;
+      try {
+        await Promise.race([
+          Promise.resolve().then(() => task()),
+          new Promise((_, reject) => {
+            timeoutId = setTimeout(() => {
+              timedOut = true;
+              this._abortActiveWork();
+              reject(new Error('backup_scan_stalled'));
+            }, SCAN_PROGRESS_STALL_TIMEOUT_MS);
+          }),
+        ]);
+        return;
+      } catch (error) {
+        const isCancelled = job && job.cancelRequested;
+        if (isCancelled) throw new BackupCancelledError();
+        if (timedOut && attempt >= SCAN_PROGRESS_STALL_MAX_ATTEMPTS) {
+          throw new Error('backup_scan_stalled');
+        }
+        if (!timedOut) {
+          throw error;
+        }
+        await this._refreshBucketCatalog(job);
+        await this.store.saveItems(job.run.id, job.items);
+        const attemptNumber = attempt + 1;
+        const stallMessage =
+          'No scan progress for 60s on ' +
+          bucketKey +
+          ' page ' +
+          targetPage +
+          '. Retrying the same page (' +
+          attemptNumber +
+          '/' +
+          SCAN_PROGRESS_STALL_MAX_ATTEMPTS +
+          ')…';
+        this._setRunDiagnostic(job, {
+          phase: 'retrying_scan_page',
+          bucket: bucketKey,
+          reason: stallMessage,
+        });
+        job.run.summary_text = stallMessage;
+        job.run.updated_at = Date.now();
+        await this.store.saveRun(job.run);
+        this._emitStatus(job);
+        await this._waitForDelay(SCAN_PROGRESS_STALL_RETRY_DELAY_MS);
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+      }
     }
   }
 
@@ -778,11 +1749,10 @@ class BackupService extends EventEmitter {
     const bucketKey = 'ownPrompts';
     const folderPath = path.join(
       job.run.download_dir || this.state.settings.downloadDir,
-      BACKUP_DOWNLOAD_FOLDER,
       buildBackupFolderName(job.run, bucketKey)
     );
     await fs.promises.mkdir(folderPath, { recursive: true });
-    const csvPath = path.join(folderPath, 'my-prompts.csv');
+    const csvPath = path.join(folderPath, buildPromptExportFilename(job.run));
     await this.store.writeFile(csvPath, buildPromptCsv(uniqueRows));
 
     return {
@@ -807,8 +1777,16 @@ class BackupService extends EventEmitter {
       this._throwIfCancelled(job);
 
       const preparedItem = await this._refreshBackupItemMedia(job.run, item);
-      if (!preparedItem.media_url) {
+      const canUseSmartProviders =
+        publishedDownloadMode === 'smart' &&
+        preparedItem &&
+        (preparedItem.kind === 'draft' || preparedItem.kind === 'published');
+      const requiresSmartDownloadProvider =
+        this._requiresSmartDownloadProvider(preparedItem, publishedDownloadMode) ||
+        this._shouldForceSmartDownloadProvider(job, preparedItem);
+      if (!preparedItem.media_url && !canUseSmartProviders) {
         this._clearSmartDownloadRetryState(job, preparedItem);
+        this._clearSmartDownloadProviderFallback(job, preparedItem);
         this._transitionItem(job, preparedItem, 'failed', {
           last_error: preparedItem.last_error || 'missing_media_url',
         });
@@ -817,9 +1795,25 @@ class BackupService extends EventEmitter {
         continue;
       }
 
+      const overloadWaitMs = requiresSmartDownloadProvider
+        ? this._getSmartDownloadOverloadWaitMs(job)
+        : 0;
+      if (overloadWaitMs > 0) {
+        if (nextEntry.source === 'items') {
+          this._queueDeferredSmartDownloadItem(job, preparedItem);
+          continue;
+        }
+        await this._waitForSmartDownloadRecovery(job);
+      }
+
       this._transitionItem(job, preparedItem, 'downloading', {
         attempts: (Number(preparedItem.attempts) || 0) + 1,
         last_error: '',
+      });
+      this._setRunDiagnostic(job, {
+        phase: 'downloading',
+        bucket: preparedItem.bucket,
+        reason: 'Downloading ' + preparedItem.id + '.',
       });
       job.run.summary_text = 'Downloading ' + preparedItem.id + '…';
       await this._persistJob(job, false);
@@ -829,6 +1823,7 @@ class BackupService extends EventEmitter {
       const tempDownloadPath = shouldProcessVideo
         ? buildIntermediateDownloadPath(destinationPath, preparedItem.media_ext)
         : destinationPath;
+      const existingOutputBackupPath = await this._stageExistingOutputFile(destinationPath);
       let downloadRequest = null;
       let doneOverrides = { last_error: '' };
       try {
@@ -837,9 +1832,16 @@ class BackupService extends EventEmitter {
         await downloadToFile(downloadRequest.url, tempDownloadPath, {
           acceptVideoOnErrorStatus: downloadRequest.acceptVideoOnErrorStatus,
           headers: downloadRequest.headers,
+          requireVideoContentType: downloadRequest.requireVideoContentType,
           signal: this._createActiveAbortSignal(),
         });
+        await this._assertDownloadLooksUsable(job, preparedItem, downloadRequest, tempDownloadPath, publishedDownloadMode);
         if (shouldProcessVideo) {
+          this._setRunDiagnostic(job, {
+            phase: 'processing_video',
+            bucket: preparedItem.bucket,
+            reason: this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode),
+          });
           job.run.summary_text = this._buildVideoProcessingSummary(preparedItem, audioMode, framingMode);
           await this._persistJob(job, false);
           this._emitStatus(job);
@@ -853,23 +1855,47 @@ class BackupService extends EventEmitter {
             ? processingOutcome.itemOverrides
             : doneOverrides;
         }
+        await this._cleanupDraftPublishedPost(job, preparedItem);
+        await this._discardStagedOutputFile(existingOutputBackupPath);
         this._resetSmartDownloadFailures(job, preparedItem);
         this._transitionItem(job, preparedItem, 'done', doneOverrides);
       } catch (error) {
         if (job.cancelRequested && String((error && error.message) || error || '') === 'download_cancelled') {
+          await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
           throw new BackupCancelledError();
         }
-        if (shouldProcessVideo) {
-          await this._removeFileIfPresent(tempDownloadPath);
+        if (error && error.draftPublishLimitReached) {
+          await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
+          this._clearSmartDownloadRetryState(job, preparedItem);
+          this._clearSmartDownloadProviderFallback(job, preparedItem);
+          this._transitionItem(job, preparedItem, 'queued', {
+            last_error: sanitizeString(String(error.userMessage || error.message || ''), 1024) || '',
+          });
+          job.draftPublishLimitReached = true;
+          this._setRunDiagnostic(job, {
+            phase: 'draft_limit_reached',
+            bucket: preparedItem.bucket,
+            reason: sanitizeString(String(error.userMessage || error.message || ''), 1024) || 'Draft copy-link limit reached.',
+          });
+          job.run.last_error = sanitizeString(String(error.userMessage || error.message || ''), 1024) || '';
+          job.run.summary_text = job.run.last_error || 'Draft copy-link limit reached. Resume tomorrow.';
+          await this._persistJob(job, false);
+          this._emitStatus(job);
+          break;
+        }
+        await this._removeFileIfPresent(tempDownloadPath);
+        if (shouldProcessVideo && destinationPath !== tempDownloadPath) {
           await this._removeFileIfPresent(destinationPath);
         }
-        const handledSmartFailure = this._handleSmartDownloadFailure(job, preparedItem, error, downloadRequest, publishedDownloadMode);
+        await this._restoreStagedOutputFile(existingOutputBackupPath, destinationPath);
+        const handledSmartFailure = await this._handleSmartDownloadFailure(job, preparedItem, error, downloadRequest, publishedDownloadMode);
         if (handledSmartFailure) {
           await this._persistJob(job, false);
           this._emitStatus(job);
           continue;
         }
         this._clearSmartDownloadRetryState(job, preparedItem);
+        this._clearSmartDownloadProviderFallback(job, preparedItem);
         this._transitionItem(job, preparedItem, 'failed', {
           last_error: sanitizeString(String((error && (error.userMessage || error.message)) || error || 'download_failed'), 1024) || 'download_failed',
         });
@@ -881,11 +1907,12 @@ class BackupService extends EventEmitter {
   }
 
   async _resolveDownloadRequest(job, item, publishedDownloadMode) {
-    if (!item || !item.media_url) {
+    if (!item) {
       throw new Error('missing_media_url');
     }
 
-    if (publishedDownloadMode !== 'smart' || item.kind !== 'published') {
+    if (publishedDownloadMode !== 'smart') {
+      if (!item.media_url) throw new Error('missing_media_url');
       return {
         providerId: '',
         url: item.media_url,
@@ -893,7 +1920,12 @@ class BackupService extends EventEmitter {
       };
     }
 
-    if (item.media_variant === 'no_watermark') {
+    const forceSmartProvider = this._shouldForceSmartDownloadProvider(job, item);
+
+    if (item.kind === 'draft') {
+      await this._ensureDraftSharedLink(job, item);
+    } else if (item.kind === 'published' && item.media_variant === 'no_watermark' && !forceSmartProvider) {
+      if (!item.media_url) throw new Error('missing_media_url');
       return {
         providerId: '',
         url: item.media_url,
@@ -903,9 +1935,25 @@ class BackupService extends EventEmitter {
 
     const smartDownload = this._getSmartDownloadState(job);
     if (!smartDownload || !smartDownload.providers.length) {
+      if (item.media_url) {
+        return {
+          providerId: '',
+          url: item.media_url,
+          headers: {},
+        };
+      }
       throw new Error('smart_download_no_providers');
     }
     const activeProvider = smartDownload.providers[smartDownload.activeProviderIndex];
+    if (item.kind !== 'draft' && item.kind !== 'published') {
+      if (!item.media_url) throw new Error('missing_media_url');
+      return {
+        providerId: '',
+        url: item.media_url,
+        headers: {},
+      };
+    }
+
     try {
       return await resolveSmartDownloadRequest(activeProvider.id, item, { signal: this._createActiveAbortSignal() });
     } catch (error) {
@@ -933,6 +1981,560 @@ class BackupService extends EventEmitter {
     return { handle: '', id: '' };
   }
 
+  async _getDraftPublishUsage(persistReset) {
+    const nextUsage = ensureCurrentDraftPublishUsage(this.state.draftPublishUsage);
+    const currentUsage = normalizeDraftPublishUsage(this.state.draftPublishUsage);
+    const changed =
+      nextUsage.date !== currentUsage.date ||
+      nextUsage.count !== currentUsage.count ||
+      nextUsage.last_published_at !== currentUsage.last_published_at;
+    this.state.draftPublishUsage = nextUsage;
+    if (changed && persistReset) {
+      await this._saveState();
+    }
+    return nextUsage;
+  }
+
+  _resolveScanCatalogCharacterHandle(runOrSettings) {
+    const source = runOrSettings && typeof runOrSettings === 'object'
+      ? (runOrSettings.settings && typeof runOrSettings.settings === 'object'
+          ? runOrSettings.settings
+          : runOrSettings)
+      : {};
+    return normalizeCharacterHandle(source.character_handle);
+  }
+
+  _resolveScanCatalogCharacterDraftsHandle(runOrSettings) {
+    const source = runOrSettings && typeof runOrSettings === 'object'
+      ? (runOrSettings.settings && typeof runOrSettings.settings === 'object'
+          ? runOrSettings.settings
+          : runOrSettings)
+      : {};
+    return normalizeCharacterHandle(source.character_drafts_handle);
+  }
+
+  _getScanResumeEntry(runOrSettings, bucketKey) {
+    if (!isScanResumeBucketKey(bucketKey)) return null;
+    const catalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
+    if (bucketKey === 'characterPosts') {
+      const handle = this._resolveScanCatalogCharacterHandle(runOrSettings);
+      return handle ? (catalog.characterPosts[handle] || null) : null;
+    }
+    if (bucketKey === 'characterDrafts') {
+      const handle = this._resolveScanCatalogCharacterDraftsHandle(runOrSettings);
+      return handle ? (catalog.characterDrafts[handle] || null) : null;
+    }
+    return catalog[bucketKey] || null;
+  }
+
+  async _setScanResumeEntry(runOrSettings, bucketKey, entry) {
+    if (!isScanResumeBucketKey(bucketKey)) return;
+    const catalog = normalizeScanResumeCatalog(this.state.scanResumeCatalog || createEmptyScanResumeCatalog());
+    if (bucketKey === 'characterPosts') {
+      const handle = this._resolveScanCatalogCharacterHandle(runOrSettings);
+      if (!handle) return;
+      if (entry) {
+        catalog.characterPosts[handle] = normalizeScanResumeEntry(entry);
+      } else {
+        delete catalog.characterPosts[handle];
+      }
+    } else if (bucketKey === 'characterDrafts') {
+      const handle = this._resolveScanCatalogCharacterDraftsHandle(runOrSettings);
+      if (!handle) return;
+      if (entry) {
+        catalog.characterDrafts[handle] = normalizeScanResumeEntry(entry);
+      } else {
+        delete catalog.characterDrafts[handle];
+      }
+    } else {
+      catalog[bucketKey] = entry ? normalizeScanResumeEntry(entry) : null;
+    }
+    this.state.scanResumeCatalog = catalog;
+    await this._saveState();
+  }
+
+  _getCompleteScanEntry(runOrSettings, bucketKey) {
+    if (!this._supportsCompleteScanCache(bucketKey)) return null;
+    const catalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog || createEmptyCompleteScanCatalog());
+    if (bucketKey === 'characterPosts') {
+      const handle = this._resolveScanCatalogCharacterHandle(runOrSettings);
+      return handle ? (catalog.characterPosts[handle] || null) : null;
+    }
+    if (bucketKey === 'characterDrafts') {
+      const handle = this._resolveScanCatalogCharacterDraftsHandle(runOrSettings);
+      return handle ? (catalog.characterDrafts[handle] || null) : null;
+    }
+    return catalog[bucketKey] || null;
+  }
+
+  async _setCompleteScanEntry(runOrSettings, bucketKey, entry) {
+    if (!this._supportsCompleteScanCache(bucketKey)) return;
+    const catalog = normalizeCompleteScanCatalog(this.state.completeScanCatalog || createEmptyCompleteScanCatalog());
+    if (bucketKey === 'characterPosts') {
+      const handle = this._resolveScanCatalogCharacterHandle(runOrSettings);
+      if (!handle) return;
+      if (entry) {
+        catalog.characterPosts[handle] = normalizeCompleteScanEntry(entry);
+      } else {
+        delete catalog.characterPosts[handle];
+      }
+    } else if (bucketKey === 'characterDrafts') {
+      const handle = this._resolveScanCatalogCharacterDraftsHandle(runOrSettings);
+      if (!handle) return;
+      if (entry) {
+        catalog.characterDrafts[handle] = normalizeCompleteScanEntry(entry);
+      } else {
+        delete catalog.characterDrafts[handle];
+      }
+    } else {
+      catalog[bucketKey] = entry ? normalizeCompleteScanEntry(entry) : null;
+    }
+    this.state.completeScanCatalog = catalog;
+    await this._saveState();
+  }
+
+  _getDraftSharedLinkEntry(draftId) {
+    const key = sanitizeIdToken(draftId, 256) || '';
+    if (!key) return null;
+    const catalog = normalizeDraftSharedLinkCatalog(this.state.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
+    return catalog[key] || null;
+  }
+
+  _applyStoredDraftSharedLink(item) {
+    if (!item || item.kind !== 'draft' || hasReadyDraftSharedLink(item)) return false;
+    const candidateIds = [
+      sanitizeIdToken(item.id, 256) || '',
+      sanitizeIdToken(item.draft_generation_id, 256) || '',
+    ].filter(Boolean);
+    for (let index = 0; index < candidateIds.length; index += 1) {
+      const entry = this._getDraftSharedLinkEntry(candidateIds[index]);
+      if (!entry) continue;
+      item.post_permalink = item.post_permalink || entry.permalink;
+      item.public_post_id = item.public_post_id || entry.postId;
+      return hasReadyDraftSharedLink(item);
+    }
+    return false;
+  }
+
+  async _rememberDraftSharedLink(item) {
+    if (!item || item.kind !== 'draft' || !hasReadyDraftSharedLink(item)) return false;
+    if (item.temp_public_post_id || item.temp_public_post_permalink) return false;
+    const permalink = sanitizeString(item.post_permalink, 4096) || '';
+    const postId = sanitizeIdToken(
+      item.public_post_id || extractBackupPostIdFromPermalink(permalink),
+      256
+    ) || '';
+    if (!permalink || !postId) return false;
+
+    const catalog = normalizeDraftSharedLinkCatalog(this.state.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
+    let changed = false;
+    const candidateIds = [
+      sanitizeIdToken(item.id, 256) || '',
+      sanitizeIdToken(item.draft_generation_id, 256) || '',
+    ].filter(Boolean);
+    for (let index = 0; index < candidateIds.length; index += 1) {
+      const draftId = candidateIds[index];
+      const current = normalizeDraftSharedLinkEntry(catalog[draftId]);
+      if (current && current.permalink === permalink && current.postId === postId) continue;
+      catalog[draftId] = {
+        permalink,
+        postId,
+        updatedAt: Date.now(),
+      };
+      changed = true;
+    }
+    if (!changed) return false;
+    this.state.draftSharedLinkCatalog = catalog;
+    await this._saveState();
+    return true;
+  }
+
+  async _forgetDraftSharedLink(item) {
+    if (!item || item.kind !== 'draft') return false;
+    const catalog = normalizeDraftSharedLinkCatalog(this.state.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog());
+    let changed = false;
+    const candidateIds = [
+      sanitizeIdToken(item.id, 256) || '',
+      sanitizeIdToken(item.draft_generation_id, 256) || '',
+    ].filter(Boolean);
+    for (let index = 0; index < candidateIds.length; index += 1) {
+      const draftId = candidateIds[index];
+      if (!catalog[draftId]) continue;
+      delete catalog[draftId];
+      changed = true;
+    }
+    const hadSharedLink = !!(item.post_permalink || item.public_post_id);
+    item.post_permalink = '';
+    item.public_post_id = '';
+    if (!changed && !hadSharedLink) return false;
+    this.state.draftSharedLinkCatalog = catalog;
+    await this._saveState();
+    return true;
+  }
+
+  async _draftSharedLinkResolvesWithProvider(item, providerId = 'konten') {
+    if (!item || item.kind !== 'draft' || !hasReadyDraftSharedLink(item)) return false;
+    try {
+      await resolveSmartDownloadRequest(providerId, item, { signal: this._createActiveAbortSignal() });
+      return true;
+    } catch (error) {
+      const message = sanitizeString(String((error && error.message) || error || ''), 1024) || '';
+      if (
+        /视频不存在/i.test(message) ||
+        /^download_http_404$/i.test(message) ||
+        /^smart_download_missing_mp4_url$/i.test(message) ||
+        /^smart_download_invalid_json$/i.test(message)
+      ) {
+        return false;
+      }
+      return true;
+    }
+  }
+
+  _supportsCompleteScanCache(bucketKey) {
+    return this._shouldTrackSavedItem(bucketKey);
+  }
+
+  _buildDraftPublishLimitMessage(usage) {
+    const snapshot = buildDraftPublishUsageSnapshot(usage || this.state.draftPublishUsage);
+    return 'Draft copy-link limit reached for ' + snapshot.date + ' (' + snapshot.count + '/' + snapshot.limit + '). Try again tomorrow.';
+  }
+
+  async _recordDraftPublishSuccess(job) {
+    const usage = await this._getDraftPublishUsage(false);
+    usage.count += 1;
+    usage.last_published_at = Date.now();
+    this.state.draftPublishUsage = usage;
+    if (job) job.draftPublishCount = (Number(job.draftPublishCount) || 0) + 1;
+    await this._saveState();
+    return usage;
+  }
+
+  async _applyDraftPublishThrottle(job) {
+    const lastStartedAt = Number(job && job.lastDraftPublishStartedAt) || 0;
+    const waitMs = Math.max(0, DRAFT_LINK_PUBLISH_THROTTLE_MS - (Date.now() - lastStartedAt));
+    if (waitMs > 0) {
+      await this._waitForDelay(waitMs);
+    }
+    if (job) job.lastDraftPublishStartedAt = Date.now();
+  }
+
+  _applyPublishedPostReference(item, payload) {
+    if (!item) return item;
+    if (!item.source_permalink) item.source_permalink = buildBackupPermalink(item.kind, item.id);
+    if (item.kind === 'draft') {
+      const publishedPost = extractBackupPublishedPostReference(item.kind, payload);
+      const publishedPostId = sanitizeString(
+        publishedPost && (
+          publishedPost.id ||
+          (isBackupPublishedPostPermalink(publishedPost.permalink) ? String(publishedPost.permalink).split('/').filter(Boolean).pop() : '')
+        ),
+        256
+      ) || '';
+      const publishedPermalink = isBackupPublishedPostPermalink(publishedPost && publishedPost.permalink)
+        ? publishedPost.permalink
+        : (/^s_[A-Za-z0-9]+$/i.test(publishedPostId) ? buildBackupPermalink('published', publishedPostId) : '');
+      if (publishedPermalink) item.post_permalink = publishedPermalink;
+      if (publishedPostId) item.public_post_id = publishedPostId;
+      return item;
+    }
+    item.post_permalink = item.post_permalink || item.source_permalink;
+    item.public_post_id = item.public_post_id || item.id;
+    return item;
+  }
+
+  _applyPostResponseMedia(item, responseJson) {
+    if (!item || !responseJson) return;
+    const media = pickBackupMediaSource('published', responseJson);
+    if (!media || !media.url) return;
+    if (media.variant === 'no_watermark' || media.variant === 'unknown_fallback' || !item.media_url) {
+      item.media_url = media.url;
+      item.media_variant = media.variant || '';
+      item.media_ext = media.ext || inferFileExtension(media.url, media.mimeType) || item.media_ext || 'mp4';
+      item.media_key_path = media.keyPath || item.media_key_path || '';
+      item.url_refreshed_at = Date.now();
+      item.last_error = '';
+    }
+  }
+
+  _applyDetailToBackupItem(run, item, detail) {
+    const media = pickBackupMediaSource(item.kind, detail);
+    const owner = extractOwnerIdentity(detail);
+    item.owner_handle = item.owner_handle || owner.handle || '';
+    item.owner_id = item.owner_id || owner.id || '';
+    item.prompt = item.prompt || pickPrompt(detail, null);
+    item.prompt_source = item.prompt_source || pickPromptSource(detail, null);
+    item.title = item.title || pickTitle(detail, null);
+    this._applyPublishedPostReference(item, detail);
+
+    if (!media || !media.url) {
+      item.media_url = '';
+      item.media_variant = '';
+      item.media_ext = 'mp4';
+      item.url_refreshed_at = 0;
+      item.last_error = 'refresh_missing_media_url';
+      return item;
+    }
+
+    item.media_url = media.url;
+    item.media_variant = media.variant;
+    item.media_ext = media.ext || inferFileExtension(media.url, media.mimeType);
+    item.media_key_path = media.keyPath || '';
+    item.filename = buildBackupFilename(run, item.bucket, item.id, item.media_ext);
+    item.url_refreshed_at = Date.now();
+    item.last_error = '';
+    return item;
+  }
+
+  async _publishDraftSharedLink(job, item) {
+    this._applyStoredDraftSharedLink(item);
+    if (hasReadyDraftSharedLink(item)) {
+      if (await this._draftSharedLinkResolvesWithProvider(item)) {
+        await this._rememberDraftSharedLink(item);
+        return item;
+      }
+      await this._forgetDraftSharedLink(item);
+    }
+
+    const usage = await this._getDraftPublishUsage(true);
+    if (usage.count >= DRAFT_LINK_PUBLISH_DAILY_LIMIT) {
+      const error = new Error(this._buildDraftPublishLimitMessage(usage));
+      error.draftPublishLimitReached = true;
+      error.userMessage = error.message;
+      throw error;
+    }
+
+    let detail = null;
+    try {
+      detail = await this._fetchBackupDetail('draft', item.id);
+    } catch (error) {
+      detail = buildDraftPublishFallbackDetail(item);
+      if (!detail) throw error;
+    }
+    this._applyDetailToBackupItem(job.run, item, detail);
+    this._applyStoredDraftSharedLink(item);
+    if (hasReadyDraftSharedLink(item)) {
+      if (await this._draftSharedLinkResolvesWithProvider(item)) {
+        await this._rememberDraftSharedLink(item);
+        return item;
+      }
+      await this._forgetDraftSharedLink(item);
+    }
+
+    const directConsoleBody = buildDirectDraftSharedLinkPostBody(detail, item);
+    if (!directConsoleBody) {
+      throw new Error('draft_publish_unsupported_kind');
+    }
+    item.temp_public_post_id = '';
+    item.temp_public_post_permalink = '';
+    item.temp_public_post_cleanup_error = '';
+    const { manualBearerToken, manualCookieHeader } = this._getActiveManualDraftAuth();
+    if (!manualBearerToken || !manualCookieHeader) {
+      throw new Error('backup_draft_manual_auth_required');
+    }
+
+    let lastErrorMessage = 'draft_publish_failed';
+    for (let attempt = 1; attempt <= DRAFT_LINK_PUBLISH_MAX_ATTEMPTS; attempt += 1) {
+      this._throwIfCancelled(job);
+      const usageSnapshot = buildDraftPublishUsageSnapshot(this.state.draftPublishUsage);
+      this._setRunDiagnostic(job, {
+        phase: 'publishing_shared_link',
+        bucket: item && item.bucket,
+        reason:
+          'Publishing draft shared link ' +
+          Math.min(usageSnapshot.count + 1, usageSnapshot.limit) +
+          '/' + usageSnapshot.limit +
+          ' for ' + usageSnapshot.date + '.',
+      });
+      job.run.summary_text =
+        'Publishing draft shared link ' +
+        Math.min(usageSnapshot.count + 1, usageSnapshot.limit) +
+        '/' + usageSnapshot.limit +
+        ' for ' + usageSnapshot.date + '…';
+      await this._persistJob(job, false);
+      this._emitStatus(job);
+
+      await this._applyDraftPublishThrottle(job);
+      const requestReferer = buildBackupPermalink('draft', item.id);
+      const directConsoleResult = await this.session.postDraftSharedLinkViaConsole(item.id, directConsoleBody, {
+        pageUrl: requestReferer,
+        requestReferer,
+        readyTimeoutMs: 20000,
+        useSentinel: true,
+        warmSoraAuthSession: false,
+      });
+      const response = {
+        ok: directConsoleResult && directConsoleResult.ok === true,
+        status: Number(directConsoleResult && directConsoleResult.status) || 0,
+        json: directConsoleResult && directConsoleResult.json ? directConsoleResult.json : null,
+        text: sanitizeString(directConsoleResult && directConsoleResult.text, 16384) || '',
+        error: sanitizeString(directConsoleResult && directConsoleResult.error, 2048) || '',
+        retryAfter: sanitizeString(directConsoleResult && directConsoleResult.retryAfter, 256) || '',
+        contentType: sanitizeString(directConsoleResult && directConsoleResult.contentType, 256) || '',
+        request: directConsoleResult && directConsoleResult.request ? directConsoleResult.request : null,
+      };
+
+      this._applyPublishedPostReference(item, response.json || {});
+      this._applyPostResponseMedia(item, response.json || {});
+      const cookieSummary = summarizeCookieHeader(manualCookieHeader);
+      await this._appendRunTrace(job, 'draft-publish-trace.jsonl', {
+        ts: new Date().toISOString(),
+        phase: 'draft_publish_attempt',
+        attempt,
+        item_id: item.id,
+        item_key: item.item_key || '',
+        source_permalink: item.source_permalink || '',
+        detail_url: item.detail_url || '',
+        result_source: 'manual_cookie_direct_console',
+        direct_post_action: {
+          ok: !!(directConsoleResult && directConsoleResult.ok),
+          status: Number(directConsoleResult && directConsoleResult.status) || 0,
+          error: sanitizeString(directConsoleResult && directConsoleResult.error, 2048) || '',
+          pipeline: null,
+        },
+        console_action: {
+          ok: !!(directConsoleResult && directConsoleResult.ok),
+          status: Number(directConsoleResult && directConsoleResult.status) || 0,
+          error: sanitizeString(directConsoleResult && directConsoleResult.error, 2048) || '',
+        },
+        request: {
+          url: sanitizeString(response && response.request && response.request.url, 4096)
+            || BACKUP_ORIGIN + '/backend/project_y/post',
+          referer: requestReferer,
+          body:
+            response && response.request && Object.prototype.hasOwnProperty.call(response.request, 'body')
+              ? response.request.body
+              : directConsoleBody,
+          headers: {
+            accept: '*/*',
+            authorization_present: !!manualBearerToken,
+            content_type: 'application/json',
+            referer: requestReferer,
+            bearer_present: !!manualBearerToken,
+            cookie_present: cookieSummary.present,
+            cookie_count: cookieSummary.count,
+            cookie_names: cookieSummary.names,
+            cookie_source: manualCookieHeader ? 'manual_cookie_header' : 'missing',
+          },
+        },
+        response: {
+          ok: response && response.ok === true,
+          status: Number(response && response.status) || 0,
+          content_type: sanitizeString(response && response.contentType, 256) || '',
+          json: response && response.json ? response.json : null,
+          text: sanitizeString(response && response.text, 16384) || '',
+          error: sanitizeString(response && response.error, 2048) || '',
+        },
+        network_events: Array.isArray(directConsoleResult && directConsoleResult.networkEvents)
+          ? directConsoleResult.networkEvents
+          : [],
+        pipeline: null,
+      });
+
+      this._applyPublishedPostReference(item, response.json || {});
+      this._applyPostResponseMedia(item, response.json || {});
+      if (!item.post_permalink) {
+        try {
+          const refreshedDetail = await this._fetchBackupDetail('draft', item.id);
+          this._applyDetailToBackupItem(job.run, item, refreshedDetail);
+        } catch (_error) {}
+      }
+      this._applyStoredDraftSharedLink(item);
+      if (hasReadyDraftSharedLink(item)) {
+        item.temp_public_post_permalink = sanitizeString(item.post_permalink, 4096) || '';
+        item.temp_public_post_id = sanitizeIdToken(
+          item.public_post_id || extractBackupPostIdFromPermalink(item.post_permalink),
+          256
+        ) || '';
+        item.temp_public_post_cleanup_error = '';
+        await this._recordDraftPublishSuccess(job);
+        await this._waitForDelay(DRAFT_LINK_PUBLISH_SETTLE_MS);
+        return item;
+      }
+
+      lastErrorMessage = sanitizeString(
+        response.error || ((response.status > 0) ? ('backup_http_' + response.status) : 'draft_publish_failed'),
+        1024
+      ) || 'draft_publish_failed';
+      const retryableStatus =
+        Number(response.status) === 0 ||
+        (Number(response.status) === 403 && /just a moment/i.test(String(response.text || '')));
+      if (attempt >= DRAFT_LINK_PUBLISH_MAX_ATTEMPTS || !retryableStatus) break;
+      await this._waitForDelay(getBackupRetryDelayMs(response.retryAfter, attempt));
+    }
+
+    const error = new Error(lastErrorMessage);
+    if (/copy-link limit reached|draft copy-link limit reached/i.test(lastErrorMessage)) {
+      error.draftPublishLimitReached = true;
+    }
+    error.userMessage = sanitizeString(lastErrorMessage, 1024) || 'draft_publish_failed';
+    throw error;
+  }
+
+  async _ensureDraftSharedLink(job, item) {
+    if (!item || item.kind !== 'draft') return item;
+    if (hasReadyDraftSharedLink(item)) {
+      if (await this._draftSharedLinkResolvesWithProvider(item)) {
+        return item;
+      }
+      await this._forgetDraftSharedLink(item);
+    }
+    return this._publishDraftSharedLink(job, item);
+  }
+
+  async _cleanupDraftPublishedPost(job, item) {
+    const postId = sanitizeIdToken(item && item.temp_public_post_id, 256) || '';
+    if (!postId) return;
+
+    const permalink = sanitizeString(item && item.temp_public_post_permalink, 4096)
+      || buildBackupPermalink('published', postId);
+    const response = await this.session.deletePublishedPost(postId, {
+      pageUrl: permalink,
+      requestReferer: permalink,
+      readyTimeoutMs: 15000,
+    });
+
+    await this._appendRunTrace(job, 'draft-publish-trace.jsonl', {
+      ts: new Date().toISOString(),
+      phase: 'draft_public_post_cleanup',
+      item_id: item && item.id || '',
+      item_key: item && item.item_key || '',
+      post_id: postId,
+      request: {
+        url: BACKUP_ORIGIN + '/backend/project_y/post/' + encodeURIComponent(postId),
+        referer: permalink,
+      },
+      response: {
+        ok: response && response.ok === true,
+        status: Number(response && response.status) || 0,
+        content_type: sanitizeString(response && response.contentType, 256) || '',
+        json: response && response.json ? response.json : null,
+        text: sanitizeString(response && response.text, 16384) || '',
+        error: sanitizeString(response && response.error, 2048) || '',
+      },
+      network_events: Array.isArray(response && response.networkEvents) ? response.networkEvents : [],
+    });
+
+    if (response && response.ok === true) {
+      item.download_post_permalink = sanitizeString(item.post_permalink || permalink, 4096) || '';
+      item.download_public_post_id = sanitizeIdToken(item.public_post_id || postId, 256) || '';
+      if ((sanitizeIdToken(item.public_post_id, 256) || '') === postId) {
+        item.post_permalink = '';
+        item.public_post_id = '';
+      }
+      item.temp_public_post_id = '';
+      item.temp_public_post_permalink = '';
+      item.temp_public_post_cleanup_error = '';
+      await this._forgetDraftSharedLink(item).catch(() => {});
+      return;
+    }
+
+    item.temp_public_post_cleanup_error = sanitizeString(
+      response && (response.error || response.text),
+      1024
+    ) || 'backup_public_post_cleanup_failed';
+  }
+
   _shouldFetchDiscoveryDetail(bucket, owner) {
     if (!bucket || !bucket.key) return false;
     if (bucket.key === 'castInDrafts' || bucket.key === 'castInPosts') {
@@ -942,6 +2544,7 @@ class BackupService extends EventEmitter {
   }
 
   async _refreshBackupItemMedia(run, item) {
+    this._applyStoredDraftSharedLink(item);
     const freshEnough =
       item.media_url &&
       isSignedUrlFresh(item.media_url, item.url_refreshed_at || 0, Date.now()) &&
@@ -955,29 +2558,10 @@ class BackupService extends EventEmitter {
     try {
       const response = await this.session.fetchJson(detailPath, {}, { signal: this._createActiveAbortSignal() });
       const detail = response.json || {};
-      const media = pickBackupMediaSource(item.kind, detail);
-      if (!media || !media.url) {
-        item.media_url = '';
-        item.media_variant = '';
-        item.media_ext = 'mp4';
-        item.url_refreshed_at = 0;
-        item.last_error = 'refresh_missing_media_url';
-        return item;
-      }
-      const owner = extractOwnerIdentity(detail);
-      item.owner_handle = item.owner_handle || owner.handle || '';
-      item.owner_id = item.owner_id || owner.id || '';
-      item.prompt = item.prompt || pickPrompt(detail, null);
-      item.prompt_source = item.prompt_source || pickPromptSource(detail, null);
-      item.title = item.title || pickTitle(detail, null);
-      item.media_url = media.url;
-      item.media_variant = media.variant;
-      item.media_ext = media.ext || inferFileExtension(media.url, media.mimeType);
-      item.media_key_path = media.keyPath || '';
-      item.filename = buildBackupFilename(run, item.bucket, item.id, item.media_ext);
-      item.url_refreshed_at = Date.now();
-      item.last_error = '';
-      return item;
+      const refreshedItem = this._applyDetailToBackupItem(run, item, detail);
+      this._applyStoredDraftSharedLink(refreshedItem);
+      await this._rememberDraftSharedLink(refreshedItem);
+      return refreshedItem;
     } catch (error) {
       item.last_error = sanitizeString(String((error && error.message) || error || 'refresh_failed'), 1024) || 'refresh_failed';
       return item;
@@ -1020,6 +2604,92 @@ class BackupService extends EventEmitter {
       height: options && options.height,
       signal: this._createActiveAbortSignal(),
     });
+  }
+
+  _buildInvalidDownloadedFileError(item, inspection, downloadRequest) {
+    const extLabel = (normalizeDownloadMediaExt(item && item.media_ext) || 'video').toUpperCase();
+    const sizeLabel = formatDownloadSizeLabel(inspection && inspection.size);
+    const isThirdPartyProviderDownload = !!(downloadRequest && downloadRequest.providerId);
+    if (!inspection || inspection.size <= 0) {
+      return new Error('Downloaded file was empty instead of a video.');
+    }
+    if (inspection.looksLikeHtml) {
+      return new Error('Downloaded HTML instead of a final video file.');
+    }
+    if (isThirdPartyProviderDownload && !inspection.hasKnownVideoSignature) {
+      return new Error('Third-party provider returned a file without a valid ' + extLabel + ' header.');
+    }
+    if (isThirdPartyProviderDownload && inspection.isSuspiciouslySmall) {
+      return new Error(
+        'Third-party provider returned a file only ' +
+        sizeLabel +
+        ', below the 500 KB minimum size check.'
+      );
+    }
+    if (inspection.isSuspiciouslySmall && !inspection.hasKnownVideoSignature) {
+      return new Error(
+        'Downloaded file was only ' +
+        sizeLabel +
+        ', under the 500 KB safety threshold, and did not contain a valid ' +
+        extLabel +
+        ' header.'
+      );
+    }
+    return null;
+  }
+
+  async _assertDownloadLooksUsable(job, item, downloadRequest, filePath, publishedDownloadMode) {
+    if (!filePath) return;
+    let stats = null;
+    try {
+      stats = await fs.promises.stat(filePath);
+    } catch (error) {
+      if (downloadRequest && downloadRequest.providerId) {
+        throw this._createSmartProviderError(downloadRequest.providerId, 'download', error);
+      }
+      throw error;
+    }
+    const size = Number(stats && stats.size) || 0;
+    let header = Buffer.alloc(0);
+    try {
+      header = await readFileHeader(filePath, Math.min(size, DOWNLOAD_VALIDATION_SNIFF_BYTES));
+    } catch (error) {
+      if (downloadRequest && downloadRequest.providerId) {
+        throw this._createSmartProviderError(downloadRequest.providerId, 'download', error);
+      }
+      throw error;
+    }
+    const inspection = {
+      size,
+      looksLikeHtml: looksLikeHtmlDocument(header),
+      hasKnownVideoSignature: hasKnownVideoSignature(header, item && item.media_ext),
+      isSuspiciouslySmall: size > 0 && size < DOWNLOAD_VALIDATION_MIN_VIDEO_BYTES,
+    };
+    const validationError = this._buildInvalidDownloadedFileError(item, inspection, downloadRequest);
+    if (!validationError) return;
+
+    const canRetryViaSmartProvider = this._canRetryViaSmartProvider(job, item, publishedDownloadMode);
+    if (canRetryViaSmartProvider) {
+      const wrapped = this._createSmartProviderError(
+        downloadRequest && downloadRequest.providerId ? downloadRequest.providerId : 'direct_media',
+        'download',
+        validationError
+      );
+      if (downloadRequest && downloadRequest.providerId) {
+        wrapped.smartProviderShouldSwitch = true;
+      } else {
+        wrapped.smartFallbackToProvider = true;
+      }
+      throw wrapped;
+    }
+
+    if (downloadRequest && downloadRequest.providerId) {
+      const wrapped = this._createSmartProviderError(downloadRequest.providerId, 'download', validationError);
+      wrapped.smartProviderShouldSwitch = true;
+      throw wrapped;
+    }
+
+    throw validationError;
   }
 
   async _processVideoWithRecovery(job, item, inputPath, outputPath, options) {
@@ -1172,6 +2842,45 @@ class BackupService extends EventEmitter {
     await fs.promises.rm(targetPath, { force: true }).catch(() => {});
   }
 
+  async _stageExistingOutputFile(targetPath) {
+    if (!targetPath) return '';
+    try {
+      const stats = await fs.promises.stat(targetPath);
+      if (!stats || (typeof stats.isFile === 'function' && !stats.isFile())) return '';
+    } catch (_error) {
+      return '';
+    }
+
+    const backupPath = targetPath + '.svd-prev-' + Date.now() + '-' + Math.random().toString(16).slice(2);
+    try {
+      await fs.promises.rename(targetPath, backupPath);
+      return backupPath;
+    } catch (_error) {
+      return '';
+    }
+  }
+
+  async _restoreStagedOutputFile(backupPath, targetPath) {
+    if (!backupPath || !targetPath) return;
+    try {
+      await fs.promises.stat(backupPath);
+    } catch (_error) {
+      return;
+    }
+    try {
+      await this._removeFileIfPresent(targetPath);
+      await fs.promises.mkdir(path.dirname(targetPath), { recursive: true });
+      await fs.promises.rename(backupPath, targetPath);
+    } catch (_error) {
+      await this._removeFileIfPresent(backupPath);
+    }
+  }
+
+  async _discardStagedOutputFile(backupPath) {
+    if (!backupPath) return;
+    await this._removeFileIfPresent(backupPath);
+  }
+
   _createActiveAbortSignal() {
     const controller = new AbortController();
     this.activeAbortController = controller;
@@ -1196,20 +2905,59 @@ class BackupService extends EventEmitter {
     if (!providers.length) return null;
     return {
       providers: providers,
-      activeProviderIndex: providers.length === 1 ? 0 : randomInt(providers.length),
+      activeProviderIndex: 0,
       consecutiveFailures: 0,
       deferredItems: [],
       deferredItemKeys: new Set(),
+      forceProviderItemKeys: new Set(),
       itemRetryCounts: new Map(),
       maxRetriesPerItem: Math.max(2, providers.length * 2),
       flushDeferredNow: false,
+      overloadedUntil: 0,
+      overloadedMessage: '',
     };
+  }
+
+  _requiresSmartDownloadProvider(item, publishedDownloadMode) {
+    return publishedDownloadMode === 'smart' && !!item && (
+      item.kind === 'draft' ||
+      (item.kind === 'published' && item.media_variant !== 'no_watermark')
+    );
+  }
+
+  _canRetryViaSmartProvider(job, item, publishedDownloadMode) {
+    if (publishedDownloadMode !== 'smart' || !item) return false;
+    if (item.kind !== 'draft' && item.kind !== 'published') return false;
+    return !!this._getSmartDownloadState(job);
   }
 
   _getSmartDownloadState(job) {
     return job && job.smartDownload && Array.isArray(job.smartDownload.providers) && job.smartDownload.providers.length
       ? job.smartDownload
       : null;
+  }
+
+  _shouldForceSmartDownloadProvider(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    return !!(
+      smartDownload &&
+      item &&
+      item.item_key &&
+      smartDownload.forceProviderItemKeys &&
+      smartDownload.forceProviderItemKeys.has(item.item_key)
+    );
+  }
+
+  _markItemForSmartProviderFallback(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return;
+    smartDownload.forceProviderItemKeys.add(item.item_key);
+  }
+
+  _getSmartDownloadOverloadWaitMs(job) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload) return 0;
+    return Math.max(0, Number(smartDownload.overloadedUntil) - Date.now());
   }
 
   _takeNextQueuedItem(job, nextIndex) {
@@ -1221,6 +2969,7 @@ class BackupService extends EventEmitter {
       return {
         item: deferred,
         nextIndex: nextIndex,
+        source: 'deferred',
       };
     }
 
@@ -1228,6 +2977,7 @@ class BackupService extends EventEmitter {
       return {
         item: job.items[nextIndex],
         nextIndex: nextIndex + 1,
+        source: 'items',
       };
     }
 
@@ -1275,14 +3025,45 @@ class BackupService extends EventEmitter {
     smartDownload.itemRetryCounts.delete(item.item_key);
   }
 
+  _clearSmartDownloadProviderFallback(job, item) {
+    const smartDownload = this._getSmartDownloadState(job);
+    if (!smartDownload || !item || !item.item_key) return;
+    smartDownload.forceProviderItemKeys.delete(item.item_key);
+  }
+
   _resetSmartDownloadFailures(job, item) {
     const smartDownload = this._getSmartDownloadState(job);
     if (!smartDownload) return;
     smartDownload.consecutiveFailures = 0;
+    smartDownload.overloadedUntil = 0;
+    smartDownload.overloadedMessage = '';
     this._clearSmartDownloadRetryState(job, item);
+    this._clearSmartDownloadProviderFallback(job, item);
     if (smartDownload.deferredItems.length) {
       smartDownload.flushDeferredNow = true;
     }
+  }
+
+  async _waitForSmartDownloadRecovery(job) {
+    const waitMs = this._getSmartDownloadOverloadWaitMs(job);
+    if (!(waitMs > 0)) return;
+    const smartDownload = this._getSmartDownloadState(job);
+    const overloadedMessage = (smartDownload && smartDownload.overloadedMessage) || formatSmartDownloadOverloadedMessage();
+    if (smartDownload && !smartDownload.overloadedMessage) {
+      smartDownload.overloadedMessage = overloadedMessage;
+    }
+    this._setRunDiagnostic(job, {
+      phase: 'waiting_on_provider',
+      reason: overloadedMessage,
+    });
+    if (job && job.run && !isSmartDownloadOverloadedMessage(job.run.summary_text)) {
+      job.run.summary_text = overloadedMessage;
+      job.run.updated_at = Date.now();
+      await this._persistJob(job, false);
+      this._emitStatus(job);
+    }
+    await this._waitForDelay(waitMs);
+    if (smartDownload) smartDownload.overloadedUntil = 0;
   }
 
   _switchSmartDownloadProvider(job) {
@@ -1294,8 +3075,9 @@ class BackupService extends EventEmitter {
     return true;
   }
 
-  _handleSmartDownloadFailure(job, item, error, downloadRequest, publishedDownloadMode) {
-    if (publishedDownloadMode !== 'smart' || !item || item.kind !== 'published' || item.media_variant === 'no_watermark') {
+  async _handleSmartDownloadFailure(job, item, error, downloadRequest, publishedDownloadMode) {
+    const eligibleSmartItem = this._canRetryViaSmartProvider(job, item, publishedDownloadMode);
+    if (publishedDownloadMode !== 'smart' || !eligibleSmartItem) {
       return false;
     }
 
@@ -1309,17 +3091,59 @@ class BackupService extends EventEmitter {
 
     const retryCount = (smartDownload.itemRetryCounts.get(item.item_key) || 0) + 1;
     smartDownload.itemRetryCounts.set(item.item_key, retryCount);
-    smartDownload.consecutiveFailures += 1;
+    if (error && error.smartFallbackToProvider) {
+      this._markItemForSmartProviderFallback(job, item);
+      smartDownload.consecutiveFailures = 0;
+    } else {
+      smartDownload.consecutiveFailures += 1;
+    }
     const shouldRetryItem = retryCount < smartDownload.maxRetriesPerItem;
-    const switchedProvider = smartDownload.consecutiveFailures >= 2 && this._switchSmartDownloadProvider(job);
+    const shouldSwitchProvider =
+      !(error && error.smartFallbackToProvider) &&
+      (
+        !!(error && error.smartProviderShouldSwitch) ||
+        smartDownload.consecutiveFailures >= 2
+      );
+    const switchedProvider = shouldSwitchProvider && this._switchSmartDownloadProvider(job);
+    const lastError = sanitizeString(String((error && error.message) || error || 'smart_download_failed'), 1024) || 'smart_download_failed';
+    if (
+      item &&
+      item.kind === 'draft' &&
+      hasReadyDraftSharedLink(item) &&
+      (
+        /视频不存在/i.test(lastError) ||
+        /^download_http_404$/i.test(lastError) ||
+        /^smart_download_missing_mp4_url$/i.test(lastError) ||
+        /^smart_download_invalid_json$/i.test(lastError)
+      )
+    ) {
+      await this._forgetDraftSharedLink(item);
+    }
     if (!shouldRetryItem) {
+      const overloadedMessage = smartDownload.overloadedMessage || formatSmartDownloadOverloadedMessage();
+      smartDownload.overloadedMessage = overloadedMessage;
       this._clearSmartDownloadRetryState(job, item);
-      error.userMessage = SMART_DOWNLOAD_OVERLOADED_MESSAGE;
-      job.run.summary_text = SMART_DOWNLOAD_OVERLOADED_MESSAGE;
-      return false;
+      smartDownload.consecutiveFailures = 0;
+      smartDownload.overloadedUntil = Date.now() + SMART_DOWNLOAD_OVERLOAD_RETRY_MS;
+      this._setRunDiagnostic(job, {
+        phase: 'waiting_on_provider',
+        bucket: item && item.bucket,
+        reason: 'Re-queued ' + item.id + ' after provider failure: ' + lastError,
+      });
+      this._transitionItem(job, item, 'queued', {
+        last_error: overloadedMessage,
+      });
+      job.run.active_item_key = '';
+      job.run.summary_text = overloadedMessage;
+      this._queueDeferredSmartDownloadItem(job, item);
+      return true;
     }
 
-    const lastError = sanitizeString(String((error && error.message) || error || 'smart_download_failed'), 1024) || 'smart_download_failed';
+    this._setRunDiagnostic(job, {
+      phase: switchedProvider ? 'switching_provider' : 'requeued_provider',
+      bucket: item && item.bucket,
+      reason: 'Re-queued ' + item.id + ' after provider failure: ' + lastError,
+    });
     this._transitionItem(job, item, 'queued', { last_error: lastError });
     this._queueDeferredSmartDownloadItem(job, item);
 
@@ -1336,6 +3160,9 @@ class BackupService extends EventEmitter {
     job.run.counts = applyBackupStatusTransition(job.run.counts, previousStatus, targetStatus);
     if (targetStatus === 'downloading') {
       job.run.active_item_key = item.item_key;
+    }
+    if (previousStatus === 'downloading' && targetStatus !== 'downloading' && job.run.active_item_key === item.item_key) {
+      job.run.active_item_key = '';
     }
     if (targetStatus === 'done' || targetStatus === 'failed' || targetStatus === 'skipped') {
       if (job.run.active_item_key === item.item_key) job.run.active_item_key = '';
@@ -1365,12 +3192,69 @@ class BackupService extends EventEmitter {
     this.emit('status', {
       run: summarizeBackupRun(job.run),
       bucket_progress: this._buildBucketProgressSnapshot(job.run, job.items, job.run.settings),
+      draft_publish_usage: buildDraftPublishUsageSnapshot(this.state.draftPublishUsage),
     });
+  }
+
+  _buildDraftPublishSummarySuffix(job) {
+    const publishedCount = Math.max(0, Number(job && job.draftPublishCount) || 0);
+    if (!publishedCount) return '';
+    const usage = buildDraftPublishUsageSnapshot(this.state.draftPublishUsage);
+    return ' ' + publishedCount + ' draft shared links published (' + usage.count + '/' + usage.limit + ' used today).';
+  }
+
+  async _finalizeDraftPublishLimitedRun(job) {
+    const queuedCount = Math.max(0, Number(job && job.run && job.run.counts && job.run.counts.queued) || 0);
+    const usage = buildDraftPublishUsageSnapshot(this.state.draftPublishUsage);
+    job.run.status = 'completed';
+    job.run.completed_at = Date.now();
+    job.run.updated_at = Date.now();
+    job.run.active_item_key = '';
+    job.run.summary_text =
+      'Stopped at the draft copy-link daily limit. ' +
+      (Number(job.run.counts.done) || 0) +
+      ' downloaded so far, ' +
+      queuedCount +
+      ' still queued for the next run. ' +
+      usage.count + '/' + usage.limit + ' used today.';
+    await this._persistJob(job, true);
+    await this.store.exportManifest(job.run, job.items, 'manifest');
+    await this.store.exportManifest(job.run, job.items, 'failures');
+    await this.store.exportManifest(job.run, job.items, 'summary');
+    this._emitStatus(job);
   }
 
   _buildBucketProgressSnapshot(run, items, settings) {
     const historicalCounts = buildBackupHistoricalBucketCounts(this.state.bucketCatalog, settings || this.state.settings);
     return buildBackupBucketProgressSnapshot(run, items, historicalCounts);
+  }
+
+  async _appendRunTrace(job, filename, payload) {
+    if (!job || !job.run || !job.run.id || !filename) return;
+    try {
+      const runDir = this.store.getRunDir(job.run.id);
+      await fs.promises.mkdir(runDir, { recursive: true });
+      await fs.promises.appendFile(
+        path.join(runDir, filename),
+        JSON.stringify(payload) + '\n',
+        'utf8'
+      );
+    } catch (_error) {}
+  }
+
+  _setRunDiagnostic(job, updates) {
+    if (!job || !job.run) return;
+    const current = job.run.diagnostic && typeof job.run.diagnostic === 'object'
+      ? job.run.diagnostic
+      : { phase: '', bucket: '', reason: '' };
+    const next = updates && typeof updates === 'object' ? updates : {};
+    job.run.diagnostic = {
+      phase: sanitizeString(next.phase, 64) || current.phase || '',
+      bucket: sanitizeString(next.bucket, 64) || current.bucket || '',
+      reason: Object.prototype.hasOwnProperty.call(next, 'reason')
+        ? (sanitizeString(next.reason, 1024) || '')
+        : (current.reason || ''),
+    };
   }
 
   async _refreshBucketCatalog(job) {
@@ -1379,7 +3263,7 @@ class BackupService extends EventEmitter {
     const nextSerialized = JSON.stringify(nextCatalog);
     if (previousSerialized === nextSerialized) return;
     this.state.bucketCatalog = nextCatalog;
-    await this.store.saveState(this.state);
+    await this._saveState();
   }
 
   _buildSavedIdSetsForRun(run) {
@@ -1395,9 +3279,20 @@ class BackupService extends EventEmitter {
     };
   }
 
+  _shouldTrackSavedItem(bucketKey) {
+    const key = sanitizeString(bucketKey, 64) || '';
+    return (
+      key === 'ownPosts' ||
+      key === 'ownDrafts' ||
+      key === 'castInPosts' ||
+      key === 'castInDrafts' ||
+      key === 'characterPosts'
+    );
+  }
+
   _isAlreadySaved(job, bucketKey, itemId) {
     const key = sanitizeString(bucketKey, 64) || '';
-    if (key !== 'castInPosts' && key !== 'castInDrafts' && key !== 'characterPosts') return false;
+    if (!this._shouldTrackSavedItem(key)) return false;
     return !!(job && job.savedIds && job.savedIds[key] && job.savedIds[key].has(itemId));
   }
 
@@ -1416,25 +3311,33 @@ class BackupService extends EventEmitter {
     const nextSerialized = JSON.stringify(nextCatalog);
     if (previousSerialized === nextSerialized) return;
     this.state.savedCatalog = nextCatalog;
-    await this.store.saveState(this.state);
+    await this._saveState();
   }
 
   _shouldDownloadIncrementalBatch(bucketKey) {
     const key = sanitizeString(bucketKey, 64) || '';
-    return key === 'castInPosts' || key === 'castInDrafts' || key === 'characterPosts';
+    return key === 'ownDrafts' || key === 'castInPosts' || key === 'castInDrafts' || key === 'characterPosts';
   }
 
   async _downloadIncrementalBatch(job, bucket) {
     const queuedCount = (job.items || []).filter((item) => item.bucket === bucket.key && normalizeItemStatus(item.status) === 'queued').length;
     if (!queuedCount) return;
     await this.store.saveItems(job.run.id, job.items);
+    this._setRunDiagnostic(job, {
+      phase: 'downloading_batch',
+      bucket: bucket.key,
+      reason: 'Starting downloads for ' + queuedCount + ' newly found ' + bucket.key + ' items.',
+    });
     job.run.status = 'running';
     job.run.summary_text = 'Downloading ' + queuedCount + ' newly found ' + bucket.key + ' videos…';
     job.run.updated_at = Date.now();
-    await this.store.saveRun(job.run);
-    this._emitStatus(job);
     await this._downloadQueuedItems(job);
-    if (job.cancelRequested) return;
+    if (job.cancelRequested || job.draftPublishLimitReached) return;
+    this._setRunDiagnostic(job, {
+      phase: 'scanning',
+      bucket: bucket.key,
+      reason: 'Continuing ' + bucket.key + ' scan after incremental downloads.',
+    });
     job.run.status = 'discovering';
     job.run.summary_text = 'Continuing ' + bucket.key + ' scan…';
     job.run.updated_at = Date.now();
@@ -1442,23 +3345,82 @@ class BackupService extends EventEmitter {
     this._emitStatus(job);
   }
 
-  async _hydrateSavedCatalogFromRuns() {
+  async _hydrateSavedCatalogFromRuns(accountKey, force) {
+    const targetAccountKey = sanitizeString(accountKey, 256) || this._getActiveAccountKey();
+    const scoped = this._ensureScopedAccountState(targetAccountKey);
+    const existingDraftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(
+      scoped.draftSharedLinkCatalog || createEmptyDraftSharedLinkCatalog()
+    );
+    const hasHydratedDraftSharedLinks = Object.keys(existingDraftSharedLinkCatalog).length > 0;
+    const draftSharedLinkCatalogVersion = Math.max(0, Math.floor(Number(scoped.draftSharedLinkCatalogVersion) || 0));
+    if (
+      scoped.savedCatalogHydrated === true &&
+      force !== true &&
+      hasHydratedDraftSharedLinks &&
+      draftSharedLinkCatalogVersion >= DRAFT_SHARED_LINK_CATALOG_VERSION
+    ) {
+      if (targetAccountKey === this._getActiveAccountKey()) {
+        this.state.savedCatalog = normalizeBackupBucketCatalog(scoped.savedCatalog || createEmptyBackupBucketCatalog());
+        this.state.draftSharedLinkCatalog = existingDraftSharedLinkCatalog;
+        this.state.draftSharedLinkCatalogVersion = draftSharedLinkCatalogVersion;
+      }
+      return;
+    }
     const runIds = await this.store.listRunIds();
-    let nextCatalog = normalizeBackupBucketCatalog(this.state.savedCatalog || createEmptyBackupBucketCatalog());
-    const resetCatalog = normalizeCacheResetCatalog(this.state.cacheResetCatalog);
+    let nextCatalog = createEmptyBackupBucketCatalog();
+    let nextDraftSharedLinkCatalog = createEmptyDraftSharedLinkCatalog();
+    const resetCatalog = targetAccountKey === this._getActiveAccountKey()
+      ? normalizeCacheResetCatalog(this.state.cacheResetCatalog)
+      : normalizeCacheResetCatalog(scoped.cacheResetCatalog);
     for (let index = 0; index < runIds.length; index += 1) {
       const runId = runIds[index];
       const run = await this.store.getRun(runId);
       if (!run) continue;
+      if (buildAccountStateKey(run.current_user || {}) !== targetAccountKey) continue;
       const items = await this.store.getItems(runId);
-      const doneItems = (items || []).filter((item) => {
+      const allDoneItems = (items || []).filter((item) => normalizeItemStatus(item && item.status) === 'done');
+      const doneItems = allDoneItems.filter((item) => {
         if (normalizeItemStatus(item && item.status) !== 'done') return false;
         return this._shouldKeepSavedItemAfterCacheReset(run, item, resetCatalog);
       });
-      if (!doneItems.length) continue;
-      nextCatalog = recordBackupItemsInBucketCatalog(nextCatalog, run, doneItems);
+      if (doneItems.length) {
+        nextCatalog = recordBackupItemsInBucketCatalog(nextCatalog, run, doneItems);
+      }
+      for (let itemIndex = 0; itemIndex < allDoneItems.length; itemIndex += 1) {
+        const item = allDoneItems[itemIndex];
+        if (!item || item.kind !== 'draft' || !hasReadyDraftSharedLink(item)) continue;
+        const permalink = sanitizeString(item.post_permalink, 4096) || '';
+        const postId = sanitizeIdToken(
+          item.public_post_id || extractBackupPostIdFromPermalink(permalink),
+          256
+        ) || '';
+        if (!permalink || !postId) continue;
+        const candidateIds = [
+          sanitizeIdToken(item.id, 256) || '',
+          sanitizeIdToken(item.draft_generation_id, 256) || '',
+        ].filter(Boolean);
+        for (let candidateIndex = 0; candidateIndex < candidateIds.length; candidateIndex += 1) {
+          const draftId = candidateIds[candidateIndex];
+          const existingEntry = normalizeDraftSharedLinkEntry(nextDraftSharedLinkCatalog[draftId]);
+          const nextUpdatedAt = Math.max(0, Math.floor(Number(run.completed_at || run.updated_at || Date.now()) || 0));
+          if (existingEntry && Number(existingEntry.updatedAt || 0) > nextUpdatedAt) continue;
+          nextDraftSharedLinkCatalog[draftId] = {
+            permalink,
+            postId,
+            updatedAt: nextUpdatedAt,
+          };
+        }
+      }
     }
-    this.state.savedCatalog = nextCatalog;
+    scoped.savedCatalog = nextCatalog;
+    scoped.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(nextDraftSharedLinkCatalog);
+    scoped.draftSharedLinkCatalogVersion = DRAFT_SHARED_LINK_CATALOG_VERSION;
+    scoped.savedCatalogHydrated = true;
+    if (targetAccountKey === this._getActiveAccountKey()) {
+      this.state.savedCatalog = normalizeBackupBucketCatalog(nextCatalog);
+      this.state.draftSharedLinkCatalog = normalizeDraftSharedLinkCatalog(nextDraftSharedLinkCatalog);
+      this.state.draftSharedLinkCatalogVersion = DRAFT_SHARED_LINK_CATALOG_VERSION;
+    }
   }
 
   _buildClearCacheTargets() {
@@ -1542,6 +3504,10 @@ class BackupService extends EventEmitter {
   async _failJob(job, error) {
     if (!job || !job.run) return;
     job.run.status = 'failed';
+    this._setRunDiagnostic(job, {
+      phase: 'failed',
+      reason: sanitizeString(String((error && error.message) || error || 'backup_failed'), 1024) || 'backup_failed',
+    });
     job.run.completed_at = Date.now();
     job.run.updated_at = Date.now();
     job.run.active_item_key = '';
@@ -1553,6 +3519,161 @@ class BackupService extends EventEmitter {
     await this.store.exportManifest(job.run, job.items, 'summary');
     this._emitStatus(job);
     if (this.currentJob === job) this.currentJob = null;
+  }
+
+  async scanPostStats(progressCallback) {
+    await this.session.ensureAuthHeaders();
+    const allPosts = [];
+    let cursor = null;
+    let page = 0;
+    const seenCursors = new Set();
+    const emitProgress = typeof progressCallback === 'function' ? progressCallback : () => {};
+
+    do {
+      page += 1;
+      let pageJson = null;
+      let fetchSucceeded = false;
+
+      for (let attempt = 1; attempt <= SCAN_PROGRESS_STALL_MAX_ATTEMPTS; attempt += 1) {
+        let timeoutId = null;
+        let timedOut = false;
+        try {
+          await Promise.race([
+            (async () => {
+              const params = { limit: 50, cut: 'nf2' };
+              if (cursor) params.cursor = cursor;
+              const response = await this.session.fetchJson('/backend/project_y/profile_feed/me', params, {
+                signal: this._createActiveAbortSignal(),
+              });
+              pageJson = response.json || {};
+              fetchSucceeded = true;
+            })(),
+            new Promise((_, reject) => {
+              timeoutId = setTimeout(() => {
+                timedOut = true;
+                this._abortActiveWork();
+                reject(new Error('post_stats_scan_stalled'));
+              }, SCAN_PROGRESS_STALL_TIMEOUT_MS);
+            }),
+          ]);
+          break;
+        } catch (error) {
+          if (timedOut && attempt >= SCAN_PROGRESS_STALL_MAX_ATTEMPTS) {
+            throw new Error('Post stats scan stalled on page ' + page + ' after ' + SCAN_PROGRESS_STALL_MAX_ATTEMPTS + ' attempts.');
+          }
+          if (!timedOut) {
+            throw error;
+          }
+          emitProgress({
+            page,
+            count: allPosts.length,
+            done: false,
+            retrying: true,
+            attempt: attempt + 1,
+            maxAttempts: SCAN_PROGRESS_STALL_MAX_ATTEMPTS,
+          });
+          await this._waitForDelay(SCAN_PROGRESS_STALL_RETRY_DELAY_MS);
+        } finally {
+          if (timeoutId) clearTimeout(timeoutId);
+        }
+      }
+
+      if (!fetchSucceeded || !pageJson) break;
+
+      const items = extractItemsFromPayload(pageJson);
+      if (!items.length) break;
+      for (let i = 0; i < items.length; i += 1) {
+        const entry = items[i];
+        const post = entry && entry.post ? entry.post : entry;
+        if (!post || !post.is_owner) continue;
+        const attachment = post.attachments && post.attachments.length ? post.attachments[0] : {};
+        const thumbnailEncoding = attachment.encodings && attachment.encodings.thumbnail;
+        allPosts.push({
+          post_id: post.id || '',
+          timestamp: post.posted_at || 0,
+          caption: post.text || post.caption || '',
+          permalink: post.permalink || '',
+          view_count: post.view_count || 0,
+          unique_view_count: post.unique_view_count || 0,
+          like_count: post.like_count || 0,
+          reply_count: post.reply_count || 0,
+          recursive_reply_count: post.recursive_reply_count || 0,
+          share_count: post.share_count || 0,
+          repost_count: post.repost_count || 0,
+          remix_count: post.remix_count || 0,
+          duration_s: attachment.duration_s || 0,
+          width: attachment.width || 0,
+          height: attachment.height || 0,
+          thumbnail_url: (thumbnailEncoding && thumbnailEncoding.path) || '',
+        });
+      }
+
+      const nextCursor = extractCursorFromPayload(pageJson);
+      if (nextCursor && !seenCursors.has(nextCursor)) {
+        seenCursors.add(nextCursor);
+        cursor = nextCursor;
+      } else {
+        cursor = null;
+      }
+
+      emitProgress({ page, count: allPosts.length, done: !cursor });
+    } while (cursor);
+
+    let savedPath = null;
+    if (allPosts.length > 0) {
+      try {
+        const downloadDir = (this.state.settings && this.state.settings.downloadDir) || '';
+        if (downloadDir) {
+          const stamp = new Date().toISOString().replace(/[:.]/g, '-').replace('T', '_').slice(0, 19);
+          const filePath = path.join(downloadDir, 'Post Stats', 'post-stats-' + stamp + '.csv');
+          const csvContent = this._buildPostStatsCsv(allPosts);
+          const saved = await this.store.writeFile(filePath, csvContent);
+          savedPath = saved.path;
+        }
+      } catch (_saveErr) {}
+    }
+
+    return { posts: allPosts, savedPath };
+  }
+
+  _buildPostStatsCsv(posts) {
+    const headers = ['Post ID', 'Post Date', 'Caption', 'Post URL', 'Total Views', 'Unique Views', 'Likes', 'Replies', 'Total Replies', 'Shares', 'Reposts', 'Remixes', 'Video Duration (s)', 'Video Width', 'Video Height', 'Thumbnail URL'];
+    const rows = [headers.join(',')];
+    for (let i = 0; i < posts.length; i += 1) {
+      const p = posts[i];
+      const postDate = p.timestamp ? new Date(p.timestamp * 1000).toISOString().replace('T', ' ').replace(/\.\d+Z$/, '') : '';
+      rows.push([
+        p.post_id,
+        postDate,
+        '"' + String(p.caption || '').replace(/"/g, '""') + '"',
+        p.permalink,
+        p.view_count,
+        p.unique_view_count,
+        p.like_count,
+        p.reply_count,
+        p.recursive_reply_count,
+        p.share_count,
+        p.repost_count,
+        p.remix_count,
+        p.duration_s,
+        p.width,
+        p.height,
+        '"' + String(p.thumbnail_url || '').replace(/"/g, '""') + '"',
+      ].join(','));
+    }
+    return rows.join('\n') + '\n';
+  }
+
+  async fetchCharacterStats(handle) {
+    await this.session.ensureAuthHeaders();
+    const cleanHandle = String(handle || '').replace(/^@/, '').trim();
+    if (!cleanHandle) throw new Error('No character handle provided.');
+    const profile = await this.session.fetchJson(
+      '/backend/project_y/profile/username/' + encodeURIComponent(cleanHandle),
+      {},
+      { maxAttempts: 2 }
+    );
+    return profile;
   }
 }
 

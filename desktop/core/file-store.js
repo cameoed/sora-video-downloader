@@ -59,6 +59,8 @@ class FileStore {
   async getState() {
     return readJson(this.statePath, {
       settings: {},
+      activeAccountKey: '',
+      accountStates: {},
       lastRunId: '',
       session: { authenticated: false, checkedAt: 0, user: null },
       bucketCatalog: {
@@ -84,6 +86,28 @@ class FileStore {
         castInDrafts: [],
         characterPosts: {},
         ownPrompts: [],
+      },
+      completeScanCatalog: {
+        ownPosts: null,
+        ownDrafts: null,
+        castInPosts: null,
+        castInDrafts: null,
+        characterPosts: {},
+      },
+      draftPublishUsage: {
+        date: '',
+        count: 0,
+        last_published_at: 0,
+      },
+      draftSharedLinkCatalog: {},
+      draftSharedLinkCatalogVersion: 0,
+      scanResumeCatalog: {
+        ownPosts: null,
+        ownDrafts: null,
+        castInPosts: null,
+        castInDrafts: null,
+        ownPrompts: null,
+        characterPosts: {},
       },
     });
   }

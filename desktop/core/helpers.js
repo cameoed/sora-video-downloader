@@ -27,6 +27,7 @@ const {
 const BACKUP_ORIGIN = 'https://sora.chatgpt.com';
 const BACKUP_DEFAULT_FEED_LIMIT = 50;
 const BACKUP_DEFAULT_DRAFT_LIMIT = 50;
+const BACKUP_DRAFT_DOWNLOAD_PAGE_LIMIT = 100;
 const BACKUP_DOWNLOAD_FOLDER = 'Sora Video Downloader';
 const BACKUP_FETCH_MAX_ATTEMPTS = 4;
 const BACKUP_FETCH_RETRY_BASE_MS = 1500;
@@ -68,7 +69,8 @@ function normalizeBackupBucketKey(value) {
     raw === 'castInPosts' ||
     raw === 'castInDrafts' ||
     raw === 'characterPosts' ||
-    raw === 'ownPrompts'
+    raw === 'ownPrompts' ||
+    raw === 'characterDrafts'
   ) {
     return raw;
   }
@@ -84,6 +86,7 @@ function cloneBackupBucketCounts(raw) {
     castInDrafts: Number(source.castInDrafts) || 0,
     characterPosts: Number(source.characterPosts) || 0,
     ownPrompts: Number(source.ownPrompts) || 0,
+    characterDrafts: Number(source.characterDrafts) || 0,
   };
 }
 
@@ -95,6 +98,7 @@ function createEmptyBackupBucketCatalog() {
     castInDrafts: [],
     characterPosts: {},
     ownPrompts: [],
+    characterDrafts: {},
   };
 }
 
@@ -125,12 +129,22 @@ function normalizeBackupBucketCatalog(raw) {
         : [];
     });
   }
+  if (isPlainObject(source.characterDrafts)) {
+    Object.keys(source.characterDrafts).forEach((handle) => {
+      const normalizedHandle = normalizeCharacterHandle(handle);
+      if (!normalizedHandle) return;
+      normalized.characterDrafts[normalizedHandle] = Array.isArray(source.characterDrafts[handle])
+        ? source.characterDrafts[handle].map((value) => sanitizeIdToken(value, 256)).filter(Boolean)
+        : [];
+    });
+  }
   return normalized;
 }
 
 function recordBackupItemsInBucketCatalog(catalog, run, items) {
   const nextCatalog = normalizeBackupBucketCatalog(catalog);
   const characterHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_handle);
+  const characterDraftsHandle = normalizeCharacterHandle(run && run.settings && run.settings.character_drafts_handle);
   const bucketSets = {
     ownDrafts: new Set(nextCatalog.ownDrafts),
     ownPosts: new Set(nextCatalog.ownPosts),
@@ -141,6 +155,10 @@ function recordBackupItemsInBucketCatalog(catalog, run, items) {
   const characterSets = {};
   Object.keys(nextCatalog.characterPosts).forEach((handle) => {
     characterSets[handle] = new Set(nextCatalog.characterPosts[handle]);
+  });
+  const characterDraftsSets = {};
+  Object.keys(nextCatalog.characterDrafts).forEach((handle) => {
+    characterDraftsSets[handle] = new Set(nextCatalog.characterDrafts[handle]);
   });
 
   const list = Array.isArray(items) ? items : [];
@@ -153,6 +171,12 @@ function recordBackupItemsInBucketCatalog(catalog, run, items) {
       if (!characterHandle) continue;
       if (!characterSets[characterHandle]) characterSets[characterHandle] = new Set();
       characterSets[characterHandle].add(itemId);
+      continue;
+    }
+    if (bucketKey === 'characterDrafts') {
+      if (!characterDraftsHandle) continue;
+      if (!characterDraftsSets[characterDraftsHandle]) characterDraftsSets[characterDraftsHandle] = new Set();
+      characterDraftsSets[characterDraftsHandle].add(itemId);
       continue;
     }
     bucketSets[bucketKey].add(itemId);
@@ -168,12 +192,17 @@ function recordBackupItemsInBucketCatalog(catalog, run, items) {
       acc[handle] = Array.from(characterSets[handle]);
       return acc;
     }, {}),
+    characterDrafts: Object.keys(characterDraftsSets).reduce((acc, handle) => {
+      acc[handle] = Array.from(characterDraftsSets[handle]);
+      return acc;
+    }, {}),
   };
 }
 
 function buildBackupHistoricalBucketCounts(catalog, settings) {
   const normalizedCatalog = normalizeBackupBucketCatalog(catalog);
   const characterHandle = normalizeCharacterHandle(settings && settings.character_handle);
+  const characterDraftsHandle = normalizeCharacterHandle(settings && settings.character_drafts_handle);
   return {
     ownDrafts: normalizedCatalog.ownDrafts.length,
     ownPosts: normalizedCatalog.ownPosts.length,
@@ -182,6 +211,9 @@ function buildBackupHistoricalBucketCounts(catalog, settings) {
     ownPrompts: normalizedCatalog.ownPrompts.length,
     characterPosts: characterHandle && Array.isArray(normalizedCatalog.characterPosts[characterHandle])
       ? normalizedCatalog.characterPosts[characterHandle].length
+      : 0,
+    characterDrafts: characterDraftsHandle && Array.isArray(normalizedCatalog.characterDrafts[characterDraftsHandle])
+      ? normalizedCatalog.characterDrafts[characterDraftsHandle].length
       : 0,
   };
 }
@@ -213,6 +245,7 @@ function normalizeBackupRequestSettings(value) {
     audio_mode: normalizeBackupAudioMode(raw.audio_mode),
     framing_mode: normalizeBackupFramingMode(raw.framing_mode),
     character_handle: normalizeCharacterHandle(raw.character_handle),
+    character_drafts_handle: normalizeCharacterHandle(raw.character_drafts_handle),
   };
 }
 
@@ -232,9 +265,10 @@ function getSelectedBackupBuckets(scopes, settings) {
   const draftLimit = getBackupDraftLimitForSettings(normalizedSettings);
   const feedLimit = getBackupFeedLimitForSettings(normalizedSettings);
   const incrementalBatchLimit = 25;
+  const draftDownloadPageLimit = BACKUP_DRAFT_DOWNLOAD_PAGE_LIMIT;
   const buckets = [];
   if (normalized.ownDrafts) {
-    buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: draftLimit });
+    buckets.push({ key: 'ownDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: draftDownloadPageLimit });
   }
   if (normalized.ownPosts) {
     buckets.push({ key: 'ownPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: feedLimit, extraParams: { cut: 'nf2' } });
@@ -243,7 +277,7 @@ function getSelectedBackupBuckets(scopes, settings) {
     buckets.push({ key: 'castInPosts', kind: 'published', pathname: '/backend/project_y/profile_feed/me', limit: incrementalBatchLimit, extraParams: { cut: 'appearances' } });
   }
   if (normalized.castInDrafts) {
-    buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: incrementalBatchLimit });
+    buckets.push({ key: 'castInDrafts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/cameos', limit: draftDownloadPageLimit });
   }
   if (normalized.ownPrompts) {
     buckets.push({ key: 'ownPrompts', kind: 'draft', pathname: '/backend/project_y/profile/drafts/v2', limit: draftLimit });
@@ -256,6 +290,15 @@ function getSelectedBackupBuckets(scopes, settings) {
       limit: incrementalBatchLimit,
       character_handle: normalizedSettings.character_handle,
       extraParams: { cut: 'appearances' },
+    });
+  }
+  if (normalized.characterDrafts && normalizedSettings.character_drafts_handle) {
+    buckets.push({
+      key: 'characterDrafts',
+      kind: 'draft',
+      pathname: '',
+      limit: draftDownloadPageLimit,
+      character_drafts_handle: normalizedSettings.character_drafts_handle,
     });
   }
   return buckets;
@@ -474,33 +517,80 @@ function resolveBackupDimensionsAndDuration(detail, item) {
 
 function buildBackupFolderName(run, bucket) {
   const settings = normalizeBackupRequestSettings(run && run.settings);
-  if (bucket === 'ownPrompts') return 'My Sora Prompts';
+  const accountPrefix = buildCurrentUserFolderAnchor(run) + "'s ";
+  if (bucket === 'ownPrompts') return accountPrefix + 'Sora Prompts';
   const watermarkLabel = settings.published_download_mode === 'direct_sora' ? 'With Watermark' : 'No Watermark';
   const audiomarkLabel = settings.audio_mode === 'with_audiomark' ? 'With Label' : 'No Label';
   const framingLabel = settings.framing_mode === 'social_16_9' ? '16:9 for Social' : 'Default Crop';
-  let folderPrefix = bucket;
-  if (bucket === 'ownPosts') folderPrefix = 'My Sora Posts';
-  else if (bucket === 'ownDrafts') folderPrefix = 'My Sora Drafts';
-  else if (bucket === 'castInPosts') folderPrefix = 'Cast-in Sora Posts';
-  else if (bucket === 'castInDrafts') folderPrefix = 'Sora Drafts of Me';
+  let folderPrefix = accountPrefix + bucket;
+  if (bucket === 'ownPosts') folderPrefix = accountPrefix + 'Sora Posts';
+  else if (bucket === 'ownDrafts') folderPrefix = accountPrefix + 'Sora Drafts';
+  else if (bucket === 'castInPosts') folderPrefix = accountPrefix + 'Cast-In Posts';
+  else if (bucket === 'castInDrafts') folderPrefix = accountPrefix + 'Sora Drafts of Me';
   else if (bucket === 'characterPosts') {
     const handle = normalizeCharacterHandle(settings.character_handle);
-    folderPrefix = handle ? ((handle.charAt(0) === '@' ? handle : ('@' + handle)) + ' Sora Posts') : 'Character Sora Posts';
+    folderPrefix = handle
+      ? (handle.charAt(0) === '@' ? handle : ('@' + handle)) + "'s Posts"
+      : "Character's Posts";
+  }
+  else if (bucket === 'characterDrafts') {
+    const handle = normalizeCharacterHandle(settings.character_drafts_handle);
+    folderPrefix = handle
+      ? (handle.charAt(0) === '@' ? handle : ('@' + handle)) + "'s Drafts"
+      : "Character's Drafts";
   }
   return folderPrefix + ' - ' + watermarkLabel + ', ' + audiomarkLabel + ', ' + framingLabel;
+}
+
+function sanitizeCurrentUserHandle(value) {
+  const safeHandle = sanitizeString(value, 128);
+  if (!safeHandle) return '';
+  return String(safeHandle)
+    .trim()
+    .replace(/^@+/, '')
+    .replace(/[<>:"/\\|?*\u0000-\u001F]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 64);
+}
+
+function sanitizeCurrentUserId(value) {
+  const safeId = sanitizeIdToken(value, 128);
+  if (!safeId) return '';
+  return String(safeId)
+    .trim()
+    .replace(/[^A-Za-z0-9._-]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 64);
+}
+
+function buildCurrentUserFolderAnchor(run) {
+  const currentUser = normalizeCurrentUser(run && run.current_user);
+  const safeHandle = sanitizeCurrentUserHandle(currentUser.handle);
+  if (safeHandle) return '@' + safeHandle;
+  return sanitizeCurrentUserId(currentUser.id) || 'Account';
+}
+
+function buildPromptExportFilename(run) {
+  const currentUser = normalizeCurrentUser(run && run.current_user);
+  const safeHandle = sanitizeCurrentUserHandle(currentUser.handle);
+  if (safeHandle) return '@' + safeHandle + "'s Draft Prompts.csv";
+
+  const safeId = sanitizeCurrentUserId(currentUser.id);
+  return (safeId || 'Account') + ' Draft Prompts.csv';
 }
 
 function buildBackupFilename(run, bucket, id, ext) {
   const settings = normalizeBackupRequestSettings(run && run.settings);
   if (bucket === 'ownPrompts') {
     const folderName = buildBackupFolderName(run, bucket);
-    return path.join(BACKUP_DOWNLOAD_FOLDER, folderName, 'my-prompts.csv');
+    return path.join(folderName, buildPromptExportFilename(run));
   }
   let safeExt = sanitizeString(ext, 16) || 'mp4';
   if (settings.audio_mode === 'no_audiomark') safeExt = 'mov';
   else if (settings.framing_mode === 'social_16_9') safeExt = 'mp4';
   const folderName = buildBackupFolderName(run, bucket);
-  return path.join(BACKUP_DOWNLOAD_FOLDER, folderName, id + '.' + safeExt);
+  return path.join(folderName, id + '.' + safeExt);
 }
 
 function buildBackupDetailPath(kind, id) {
@@ -512,6 +602,71 @@ function buildBackupPermalink(kind, id) {
   return kind === 'draft'
     ? BACKUP_ORIGIN + '/d/' + encodeURIComponent(id)
     : BACKUP_ORIGIN + '/p/' + encodeURIComponent(id);
+}
+
+function extractBackupPostIdFromPermalink(permalink) {
+  const value = sanitizeString(permalink, 4096);
+  if (!value) return '';
+  try {
+    const parsed = new URL(value, BACKUP_ORIGIN);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    return sanitizeIdToken(segments.length ? segments[segments.length - 1] : '', 256) || '';
+  } catch (_error) {
+    const segments = String(value).split('/').filter(Boolean);
+    return sanitizeIdToken(segments.length ? segments[segments.length - 1] : '', 256) || '';
+  }
+}
+
+function isBackupPublishedPostPermalink(permalink) {
+  const value = sanitizeString(permalink, 4096);
+  if (!value) return false;
+  try {
+    const parsed = new URL(value, BACKUP_ORIGIN);
+    const segments = parsed.pathname.split('/').filter(Boolean);
+    return parsed.origin === BACKUP_ORIGIN && segments.length === 2 && segments[0] === 'p' && /^s_[A-Za-z0-9]+$/i.test(segments[1]);
+  } catch (_error) {
+    return false;
+  }
+}
+
+function extractBackupPublishedPostReference(kind, payload) {
+  const targetKind = String(kind || '');
+  const source = isPlainObject(payload) ? payload : {};
+  const candidates = [];
+
+  function pushCandidate(value) {
+    if (isPlainObject(value)) candidates.push(value);
+  }
+
+  if (targetKind === 'draft') {
+    const draft = resolveBackupPayloadEntity('draft', source) || source;
+    pushCandidate(draft && draft.post && draft.post.post);
+    pushCandidate(draft && draft.post);
+    pushCandidate(draft && draft.preview_asset && draft.preview_asset.post && draft.preview_asset.post.post);
+    pushCandidate(draft && draft.preview_asset && draft.preview_asset.post);
+  } else {
+    const post = resolveBackupPayloadEntity('published', source) || source;
+    pushCandidate(post && post.post);
+    pushCandidate(post);
+  }
+
+  pushCandidate(source && source.post && source.post.post);
+  pushCandidate(source && source.post);
+  pushCandidate(source && source.preview_asset && source.preview_asset.post && source.preview_asset.post.post);
+  pushCandidate(source && source.preview_asset && source.preview_asset.post);
+
+  for (let index = 0; index < candidates.length; index += 1) {
+    const candidate = candidates[index];
+    const permalink = sanitizeString(candidate && candidate.permalink, 4096) || '';
+    const id = sanitizeIdToken(
+      candidate && (candidate.id || candidate.post_id || candidate.slug),
+      256
+    ) || extractBackupPostIdFromPermalink(permalink);
+    if (!permalink && !id) continue;
+    return { id, permalink };
+  }
+
+  return { id: '', permalink: '' };
 }
 
 function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
@@ -531,6 +686,32 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
   const media = pickBackupMediaSource(kind, detail || listItem);
   const mediaExt = (media && media.ext) || 'mp4';
   const isPromptBucket = bucket === 'ownPrompts';
+  const draftEntity = kind === 'draft'
+    ? (resolveBackupPayloadEntity('draft', detail) || resolveBackupPayloadEntity('draft', listItem) || detailEntity || listEntity)
+    : null;
+  const draftSourceKind = sanitizeString(draftEntity && draftEntity.kind, 64) || '';
+  const draftGenerationId = sanitizeString(draftEntity && draftEntity.generation_id, 256) || '';
+  const draftFrameCount = Math.max(
+    0,
+    Math.floor(
+      Number(
+        (draftEntity && draftEntity.creation_config && draftEntity.creation_config.n_frames) ||
+        (draftEntity && draftEntity.n_frames) ||
+        0
+      ) || 0
+    )
+  );
+  const sourcePermalink = buildBackupPermalink(kind, id);
+  const publishedPost = kind === 'draft'
+    ? extractBackupPublishedPostReference(kind, detail || listItem)
+    : { id: id, permalink: sourcePermalink };
+  const publishedPostId = sanitizeIdToken(
+    (publishedPost && publishedPost.id) || extractBackupPostIdFromPermalink(publishedPost && publishedPost.permalink),
+    256
+  ) || '';
+  const publishedPermalink = isBackupPublishedPostPermalink(publishedPost && publishedPost.permalink)
+    ? publishedPost.permalink
+    : (/^s_[A-Za-z0-9]+$/i.test(publishedPostId) ? buildBackupPermalink('published', publishedPostId) : '');
   return {
     item_key: makeBackupItemKey(run.id, kind, id),
     run_id: run.id,
@@ -546,6 +727,9 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
     prompt: prompt,
     prompt_source: promptSource,
     title: title,
+    draft_source_kind: draftSourceKind,
+    draft_generation_id: draftGenerationId,
+    draft_n_frames: draftFrameCount,
     created_at: typeof createdAt === 'string' ? createdAt : (createdAt == null ? null : createdAt),
     posted_at: typeof postedAt === 'string' ? postedAt : (postedAt == null ? null : postedAt),
     updated_at: typeof updatedAt === 'string' ? updatedAt : (updatedAt == null ? null : updatedAt),
@@ -555,7 +739,9 @@ function buildBackupManifestItem(run, bucket, kind, listItem, detail, order) {
     cast_names: castNames,
     cameos: castNames,
     detail_url: BACKUP_ORIGIN + buildBackupDetailPath(kind, id),
-    post_permalink: buildBackupPermalink(kind, id),
+    source_permalink: sourcePermalink,
+    post_permalink: publishedPermalink,
+    public_post_id: publishedPostId,
     media_url: (media && media.url) || '',
     media_variant: (media && media.variant) || '',
     media_ext: mediaExt,
@@ -578,13 +764,18 @@ function buildBackupManifestLine(item) {
     title: item.title || '',
     prompt: item.prompt || '',
     prompt_source: item.prompt_source || '',
+    draft_source_kind: item.draft_source_kind || '',
+    draft_generation_id: item.draft_generation_id || '',
+    draft_n_frames: item.draft_n_frames == null ? '' : item.draft_n_frames,
     created_at: item.created_at || '',
     posted_at: item.posted_at || '',
     updated_at: item.updated_at || '',
+    source_permalink: item.source_permalink || '',
     width: item.width == null ? '' : item.width,
     height: item.height == null ? '' : item.height,
     duration_s: item.duration_s == null ? '' : item.duration_s,
     post_permalink: item.post_permalink || '',
+    public_post_id: item.public_post_id || '',
     detail_url: item.detail_url || '',
     cast_names: Array.isArray(item.cast_names) ? item.cast_names : [],
     cameos: Array.isArray(item.cameos) ? item.cameos : [],
@@ -635,6 +826,11 @@ function createBackupRunRecord(scopes, settings, downloadDir) {
     active_item_key: '',
     last_error: '',
     summary_text: 'Starting discovery…',
+    diagnostic: {
+      phase: 'starting',
+      bucket: '',
+      reason: '',
+    },
   };
 }
 
@@ -659,6 +855,11 @@ function summarizeBackupRun(run) {
     active_item_key: sanitizeString(run.active_item_key, 256) || '',
     last_error: sanitizeString(run.last_error, 1024) || '',
     summary_text: sanitizeString(run.summary_text, 1024) || '',
+    diagnostic: {
+      phase: sanitizeString(run && run.diagnostic && run.diagnostic.phase, 64) || '',
+      bucket: sanitizeString(run && run.diagnostic && run.diagnostic.bucket, 64) || '',
+      reason: sanitizeString(run && run.diagnostic && run.diagnostic.reason, 1024) || '',
+    },
   };
 }
 
@@ -777,9 +978,13 @@ module.exports = {
   pickPromptSource,
   pickTitle,
   buildBackupFolderName,
+  buildPromptExportFilename,
   buildBackupFilename,
   buildBackupDetailPath,
   buildBackupPermalink,
+  extractBackupPostIdFromPermalink,
+  isBackupPublishedPostPermalink,
+  extractBackupPublishedPostReference,
   buildBackupManifestItem,
   buildBackupManifestLine,
   shouldFetchDiscoveryDetail,

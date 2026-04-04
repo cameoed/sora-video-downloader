@@ -8,3 +8,4 @@ desktop/build-resources/icon.ico
 desktop/build-resources/icon.icns
 desktop/build-resources/icon.iconset/
 desktop/build-resources/ffmpeg/
+.claude/
