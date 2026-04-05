@@ -1,4 +1,4 @@
-# Sora Video Downloader
+# Sora Watermark Remover and Video Downloader
 
 Desktop app for saving your Sora videos and draft prompts! [**Get the app here!**](https://github.com/cameoed/sora-video-downloader/releases/tag/v1.1.0)
 
